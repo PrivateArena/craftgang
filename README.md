@@ -22,16 +22,20 @@ sides) and issue per-ref calls only for refs that actually differ.
 
 65 repositories, nothing to change (2026-10-20, this machine):
 
-| command | wall | API calls | where the time goes |
-| --- | --- | --- | --- |
-| `verify` | ~10 s | 4 | two GraphQL org snapshots (default branch heads) |
-| `verify -a` | ~29 s | ~169 | every-branch SHA comparison, paginated per repo |
-| `status` | ~10 s | ~134 | GraphQL index + one tiny count call per repo per side |
-| `plan` / `sync` (no changes) | ~31 s | ~261 | ref listings on both sides, at `parallel.write` |
+| command | wall | API calls | before | where the time goes |
+| --- | --- | --- | --- | --- |
+| `status` | ~9 s | 16 | 157 s / 205 | org indexes + one batched ref snapshot |
+| `verify` | ~10 s | 4 | 41 s / 133 | two GraphQL org queries carry every default branch head |
+| `verify -a` | ~34 s | ~102 | - | snapshot, then per-repo paging for what it could not prove |
+| `plan` / `sync` (no changes) | ~38 s | ~179 | 61 s / 368 | snapshot + tag listings and real per-ref work |
+| `verify -r NAME` (single repo) | ~3.4 s | 4 | - | org index skipped below `index_min_repos` |
 
 `parallel.write` was measured on this org: 47 s at width 4, 35 s at 6, 31 s at 8 and no
-further gain at 12 - the remaining time is ~261 sequential-latency round trips, not CPU
-(user + sys under 7 s). Going below that needs fewer calls, not more concurrency.
+further gain at 12 - the remaining time is round-trip latency, not CPU (user + sys under
+7 s). Going below that needs fewer calls, not more concurrency, which is what the ref
+snapshot below is for. Wall time of the GraphQL phase moves with server load: 9-16 s for
+`status` across repeated runs, and any repo whose snapshot query timed out is simply
+re-checked per repo instead of failing the run.
 
 ## Requirements
 
@@ -87,6 +91,9 @@ Precedence: **command line > environment > `config.json` > built-in default.**
 | `curl.max_time` | `CRAFTGANG_MAX_TIME` | `60` | seconds |
 | `dump_api_responses` | `CRAFTGANG_DUMP_API` | `false` | also write `body.*` / `headers.*` per API call, for debugging |
 | `log_api_calls` | `CRAFTGANG_LOG_API` | `true` | append one line per API call to `.craftgang/craftgang.log` |
+| `ref_snapshot` | `CRAFTGANG_REF_SNAPSHOT` | `true` | one batched GraphQL ref listing per 12 repos, instead of 4 paginated REST listings per repo |
+| `ref_snapshot_chunk` | `CRAFTGANG_SNAP_CHUNK` | `12` | repositories per GraphQL request: 6 costs 26 calls, 12 costs 16, 20 costs 12 but each request is slower |
+| `index_min_repos` | `CRAFTGANG_INDEX_MIN` | `8` | with `-r` for fewer repos than this, the two org-wide index queries are skipped - a single repo check costs ~3 s instead of ~10 s |
 
 `dump_api_responses` is off by default because API responses are kept in shell
 variables: a normal run writes **no** per-call files into the state directory at all
@@ -137,6 +144,21 @@ exit). Enabling it costs about two file writes per API call (~270 per full `stat
   `/branches` and `/tags` listings (`/git/refs` would loop forever there).
 * A **branch count** is read from the `Link rel="last"` header of a `per_page=1`
   request, so a 1302 branch repo costs the same single call as a 1 branch repo.
+  `status` normally does not even need that: a connection `totalCount` is exact even when
+  the returned node list stops at GitHub's page limit of 100, so the ref snapshot answers
+  the branch totals of every repo it covered.
+* **The ref snapshot compares like the API does.** A repo counts as identical only when
+  both sides reported the same ref set, the same totals, and the listing was not truncated;
+  anything else (a repo missing from one side, a timed-out GraphQL alias, over 100 refs)
+  falls back to the per-repo paginated comparison, which is slower but never guesses.
+* **The query builder stays inside awk.** `jaq` (a drop-in `jq` on some machines) has no
+  `[inputs]`, no `$ARGS.positional` and no `array[a:b]`, and `jq` reads `a // {} as $x | ...`
+  as `a // ({} as $x | ...)`, which silently returns a whole object instead of rows. The name
+  chunks are therefore cut with awk and every `// ... as $x` is parenthesised, so one code
+  path runs on both.
+* `.craftgang/drift.tsv` columns are `repo`, `branch`, `mirror head` - the third field is
+  what the mirror holds (`missing`, `unreadable`, `source-listing-failed`), never the
+  upstream value, so a row is always a statement about the mirror.
 * **`--prune` never trusts an unreadable listing.** An earlier version compared a bare
   ref name against `ref<TAB>sha` lines, which can never match, so `--prune` deleted
   every mirrored branch; it also treated a failed listing as an empty one. Both are

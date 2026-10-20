@@ -82,9 +82,14 @@ configure() { # resolve settings, then build everything that depends on them
   # responses stay in shell variables; files are only written when explicitly asked for
   DUMP_API=$(yes_no "$(resolve '' CRAFTGANG_DUMP_API dump_api_responses 0)")
   LOG_API=$(yes_no "$(resolve '' CRAFTGANG_LOG_API log_api_calls 1)")
-  # prefetch all branch/tag maps in a few batched GraphQL calls instead of 4 REST calls per repo
+  # prefetch every branch and tag ref in parallel batched GraphQL calls, instead of
+  # four paginated REST listings per repository
   REF_SNAPSHOT=$(yes_no "$(resolve '' CRAFTGANG_REF_SNAPSHOT ref_snapshot 1)")
-  SNAP_CHUNK=$(resolve '' CRAFTGANG_SNAP_CHUNK ref_snapshot_chunk 15)
+  SNAP_CHUNK=$(resolve '' CRAFTGANG_SNAP_CHUNK ref_snapshot_chunk 12)
+  # two org wide GraphQL queries answer every repository at once, but they are the slowest
+  # calls the tool makes - below this many selected repos plain per repo lookups win
+  INDEX_MIN=$(resolve '' CRAFTGANG_INDEX_MIN index_min_repos 8)
+  declare -gA SNAP_CLEAN=() SNAP_MIRROR=() SNAP_TAGS=() SNAP_UPB=() SNAP_DTB=()
   case $CMD in status|verify|plan) [[ -n ${PARALLEL:-} ]] || PARALLEL=$READ_PARALLEL ;;
                   *)               [[ -n ${PARALLEL:-} ]] || PARALLEL=$WRITE_PARALLEL ;; esac
   mkdir -p "$STATE_DIR/mirrors" "$STATE_DIR/run"
@@ -204,6 +209,19 @@ api_raw() { # api_raw METHOD PATH [JSON] -> API_STATUS, body in $RESP_BODY, head
     [[ ${#RESP_BODY} -ge ${#raw} ]] && RESP_BODY=''          # no header/body separator at all
     code=$(awk '$1 ~ /^HTTP\// { c = $2 } END { print c + 0 }' <<<"$RESP_HDR")
     API_STATUS=$code
+    # A response that stops mid JSON would be read as a short ref listing, and a short
+    # listing is what makes refs look deleted instead of merely unreadable. Retry those:
+    # JSON that starts with a brace or bracket must end with the matching closer.
+    if [[ $code != 204 && ${#RESP_BODY} -gt 2 ]]; then
+      case ${RESP_BODY:0:1} in
+        "{"|"[") case ${RESP_BODY: -1} in
+                    "}"|"]") : ;;                     # complete object or array
+                    *) API_STATUS=0
+                       (( attempt < 4 )) && warn "truncated response from $method $path (attempt $attempt)"
+                       continue ;;
+                 esac ;;
+      esac
+    fi
     if (( DUMP_API )); then                                  # diagnostics only; readers use the variables
       printf '%s' "$RESP_BODY" >"$RUN_DIR/body.$BASHPID"
       printf '%s' "$RESP_HDR" >"$RUN_DIR/headers.$BASHPID"
@@ -485,6 +503,138 @@ tag_map() { # tag_map ORG NAME -> "refs/tags/<name><TAB>commit sha"
   return 0
 }
 
+# --------------------------- batched ref snapshot --------------------------
+# A no-op run costs two branch listings plus two tag listings per repository, which is
+# ~260 sequential round trips for this organisation. GraphQL instead carries
+# `ref_snapshot_chunk` repositories (both owners, branches and tags) in one request at a
+# few points of the 5000 per hour budget, and the chunks run in parallel - so the whole
+# ref picture arrives in a couple of seconds.
+#
+# It is used for exactly one thing: proving that a repository needs no work. A repo is
+# declared clean only when both sides list the same refs with the same OIDs, with nothing
+# truncated. GraphQL branch OIDs are the same 40-char commit SHAs that /branches returns
+# (checked against the REST listings), and tags are compared GraphQL-to-GraphQL so a
+# peeled and an unpeeled SHA are never compared with each other. Everything that is not
+# provably clean falls through to the REST code paths unchanged.
+SNAP_FIELDS='{h:refs(refPrefix:"refs/heads/",first:100){totalCount nodes{name target{oid}}}t:refs(refPrefix:"refs/tags/",first:100){totalCount nodes{name target{oid}}}}'
+
+cut_names() { # rows from target_rows -> bare repository names, one per line
+  cut -d"$SEP" -f1 <<<"$1"
+}
+
+org_index_worth() { # predicate: is the org wide index cheaper than per repo lookups
+  (( ${#ONLY[@]} == 0 || ${#ONLY[@]} >= INDEX_MIN ))
+}
+
+chunk_json() { # chunk_json FILE -> the line separated names in FILE as a JSON array
+  [[ -s $1 ]] || return 1
+  awk 'BEGIN { printf "[" }
+      NF { gsub(/["]/, "", $0); gsub(/[\\]/, "", $0)
+           printf "%s\"%s\"", (n++ ? "," : ""), $0 }
+      END { printf "]\n" }' "$1"
+}
+
+snapshot_payload() { # snapshot_payload OWNER NAMES_JSON -> GraphQL request body, one alias per repo
+  jq -cn --arg owner "$1" --argjson n "${2:-[]}" --arg f "$SNAP_FIELDS" '
+    {query: ("query{repositoryOwner(login:" + ($owner | tojson) + "){" +
+      ([ range(0; $n | length) as $i
+         | "r\($i):repository(name:\($n[$i] | tojson))\($f)" ] | join("")) + "}}")}'
+}
+
+snapshot_job() { # "SIDE<TAB>INDEX" -> rows for that chunk; own file, so parallel jobs never share one
+  local side idx names owner
+  IFS=$'\t' read -r side idx <<<"$1"
+  names=$(chunk_json "$RUN_DIR/snap.names.$idx")
+  [[ -n $names ]] || return 1
+  if [[ $side == src ]]; then owner=$SOURCE_ORG; else owner=$TARGET_ORG; fi
+  api_raw POST "/graphql" "$(snapshot_payload "$owner" "$names")" || return 1
+  [[ $API_STATUS == 200 ]] || return 1
+  # A response can carry data and errors at the same time (a timed out alias is reported in
+  # .errors, its repository is then null). Only whole failures matter here: a repo with rows on
+  # one side but not the other simply cannot be proven equal and falls back to per repo listings.
+  jqb -r --arg side "$side" --argjson n "$names" '
+    (.data.repositoryOwner // {}) as $o
+    | range(0; $n | length) as $i
+    | ($o["r" + ($i | tostring)] // empty) as $r
+    | ($n[$i]) as $name
+    | ($r.h.nodes // [] | sort_by(.name)) as $hn
+    | ($r.t.nodes // [] | sort_by(.name)) as $tn
+    | ($hn[] | [$side, $name, "h", "refs/heads/" + .name, .target.oid, ($r.h.totalCount | tostring)] | @tsv),
+      ($tn[] | [$side, $name, "t", "refs/tags/" + .name, .target.oid, ($r.t.totalCount | tostring)] | @tsv),
+      (if ($hn | length) == 0 and ($tn | length) == 0
+       then [$side, $name, "e", "-", "-", "0"] | @tsv else empty end)' \
+    >"$RUN_DIR/snap.rows.$side.$idx.tsv"
+}
+
+snapshot_clean() { # side by side comparison of the two listings; marks repos with nothing to do
+  local rows=$RUN_DIR/snap.rows.tsv f found=0 n s d t
+  : >"$rows"
+  for f in "$RUN_DIR"/snap.rows.*.tsv; do
+    [[ -s $f ]] || continue
+    cat "$f" >>"$rows"; found=1
+  done
+  (( found )) || return 1
+  awk -F'\t' '
+    function nl(s,  t) { t = s; return gsub(/\n/, "", t) }
+    { k = $1 "|" $2 "|" $3
+      set[k] = set[k] $4 " " $5 "\n"
+      tot[k] = $6 + 0
+      name[$2] = 1 }
+    END {
+      split("h t e", kinds, " ")
+      for (n in name) {
+        ok = 1
+        for (i = 1; i <= 3; i++) {
+          a = "src|" n "|" kinds[i]; b = "dst|" n "|" kinds[i]
+          ha = (a in set); hb = (b in set)
+          if (!ha && !hb) continue                       # kind not reported on either side
+          if (!ha || !hb) { ok = 0; break }             # reported on one side only
+          if (set[a] != set[b]) { ok = 0; break }
+          if (kinds[i] == "e") continue                 # no refs at all on both sides
+          if (tot[a] != tot[b] || tot[a] > 100) { ok = 0; break }
+          if (nl(set[a]) != tot[a]) { ok = 0; break }   # truncated or partial listing
+        }
+        if (!ok) continue
+        hd = "src|" n "|h"; dh = "dst|" n "|h"; td = "src|" n "|t"
+        printf "%s\t%d\t%d\t%d\n", n, (hd in tot) ? tot[hd] : 0, (dh in tot) ? tot[dh] : 0,
+               (td in tot) ? tot[td] : 0
+      }
+    }' "$rows" >"$RUN_DIR/snap.clean.tsv"
+  while IFS=$'\t' read -r n s d t; do
+    SNAP_CLEAN[$n]=$s; SNAP_MIRROR[$n]=$d; SNAP_TAGS[$n]=$t
+  done <"$RUN_DIR/snap.clean.tsv"
+  # a connection totalCount is exact even when the node list is capped, so the per side
+  # branch totals of the big repos are known here too - one less REST call each later on
+  while IFS=$'\t' read -r side n kind ref sha total; do
+    case $kind in
+      h) [[ $side == src ]] && SNAP_UPB[$n]=$total || SNAP_DTB[$n]=$total ;;
+      e) [[ $side == src ]] && SNAP_UPB[$n]=0       || SNAP_DTB[$n]=0 ;;
+    esac
+  done <"$rows"
+  return 0
+}
+
+build_ref_snapshot() { # build_ref_snapshot <repo names on stdin>: parallel chunked ref snapshot
+  local n=0 base=0 name f idx
+  [[ $REF_SNAPSHOT == 1 ]] || return 0
+  # Chunking is done with plain files rather than jq slices: the jq here is jaq, which has
+  # neither [inputs] nor array slicing.
+  while IFS= read -r name; do
+    [[ -z $name ]] && continue
+    (( n % SNAP_CHUNK == 0 )) && base=$n
+    printf '%s\n' "$name" >>"$RUN_DIR/snap.names.$base"
+    n=$((n + 1))
+  done
+  (( n )) || return 0
+  for f in "$RUN_DIR"/snap.names.*; do
+    [[ -f $f ]] || continue
+    idx=${f##*snap.names.}
+    printf 'src\t%s\ndst\t%s\n' "$idx" "$idx"
+  done | run_pool snapshot_job
+  snapshot_clean || warn "ref snapshot produced nothing - falling back to per-repo listings"
+  return 0
+}
+
 sha_of() { # sha_of MAPFILE REFNAME -> sha
   awk -F'\t' -v r="$2" '$1 == r { print $2; exit }' "$1"
 }
@@ -524,7 +674,7 @@ merge_upstream() { # NAME BRANCH -> "synced|upto-date|conflict:<msg>"
 }
 
 sync_branches() { # NAME -> branch<TAB>action<TAB>note   (2 bulk calls when nothing changed)
-  local name=$1 ref sha tsha act branch
+  local name=$1 ref sha tsha act note branch prev qual=''
   local up=$RUN_DIR/up.$name.tmp tp=$RUN_DIR/dst.$name.tmp
   ref_map "$SOURCE_ORG" "$name" >"$up" || {
     printf '%s\t%s\t%s\n' '-' list-failed "upstream branches: HTTP $API_STATUS"; return 1; }
@@ -543,14 +693,21 @@ sync_branches() { # NAME -> branch<TAB>action<TAB>note   (2 bulk calls when noth
     elif [[ $FORCE == 1 ]]; then
       act=$(force_sha "$name" "$ref" "$sha" "$tsha")
     else
-      act=$(merge_upstream "$name" "$branch")
+      prev=$(merge_upstream "$name" "$branch")
+      qual="(after ${prev%%:*})"
       # a mirror must match exactly: fast-forward if possible, hard reset otherwise
       tsha=$(target_sha "$name" "$branch")
       if [[ $tsha != "$sha" ]]; then
-        act="$(force_sha "$name" "$ref" "$sha" "$tsha") ${dim}(after ${act%%:*})${off}"
+        act=$(force_sha "$name" "$ref" "$sha" "$tsha")
+      else
+        act=$prev; qual=''
       fi
     fi
-    printf '%s\t%s\t%s\n' "$branch" "${act%%:*}" "${act#*:}"
+    # actions come back as "verb:detail"; a bare verb (would-sync, upto-date, ...) has no detail
+    note=''
+    if [[ $act == *:* ]]; then note=${act#*:}; act=${act%%:*}; fi
+    [[ -n $qual ]] && note="$qual${note:+ }$note"
+    printf '%s\t%s\t%s\n' "$branch" "$act" "$note"
   done <"$up"
   [[ $PRUNE == 1 ]] || rm -f "$up" "$tp"   # --prune reuses these maps instead of re-fetching them
   return 0
@@ -673,6 +830,13 @@ sync_one() { # one row from source_repos
     http*) emit "  ${red}error${off}      $name - $st"; flush; return 1 ;;
     plain) emit "  ${dim}plain repo${off}   $name - refs pushed server side" ;;
   esac
+  local snap cnt; snap=${SNAP_CLEAN[$name]:-}
+  if [[ -n $snap ]]; then                    # branches and tags all proven identical by the snapshot
+    emit "  ${grn}ok${off}         $name ${dim}${snap} branches | 0 updated | ${snap} current${off}"
+    cnt=${SNAP_TAGS[$name]:-0}
+    [[ $cnt != 0 ]] && emit "    ${grn}current${off} ${dim}${cnt} tag(s) identical${off}"
+    flush; return 0
+  fi
   local b act note n=0 up=0 cur=0 bad=0 need_mirror=0
   while IFS=$'\t' read -r b act note; do
     [[ -z ${b:-} ]] && continue
@@ -720,9 +884,18 @@ single_run_guard() { # refuse two concurrent runs (they would fight over refs)
 cmd_sync() {
   load_token
   single_run_guard
-  build_target_index
+  if org_index_worth; then
+    if [[ -z ${ALL:-} ]]; then
+      build_snapshot                  # head SHAs for the whole org in 2 calls, not 2 per repo
+    else
+      build_target_index
+    fi
+  fi
   local rows total
   rows=$(target_rows) || die "cannot list $SOURCE_ORG"
+  # one batched snapshot replaces 4 paginated listings per repo, including the tag lists that
+  # a default branch sync would otherwise have to page through repo by repo
+  build_ref_snapshot <<<"$(cut_names "$rows")"
   total=$(grep -c . <<<"$rows")
   say "${bold}$SOURCE_ORG${off}  ->  ${bold}$TARGET_ORG${off}   $total repositories   ${dim}server side, nothing on disk${off}"
   [[ $DRY == 1 ]] && say "${ylw}dry run - no changes${off}"
@@ -740,8 +913,15 @@ status_one() { # one row -> "state<TAB>na<TAB>nb<TAB>note" in $RUN_DIR/status.<n
   local name archived isfork parent def priv size st na nb state note rc=0
   IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
   st=$(target_state "$name")
-  nb=$(count_branches "$SOURCE_ORG" "$name") || { nb='?'; rc=1; }
-  na=$(count_branches "$TARGET_ORG" "$name") || { na='?'; rc=1; }
+  nb=${SNAP_CLEAN[$name]:-}
+  if [[ -n $nb ]]; then                             # counts come from the snapshot that proved equality
+    na=${SNAP_MIRROR[$name]}
+  else
+    nb=${SNAP_UPB[$name]:-}
+    [[ -n $nb ]] || nb=$(count_branches "$SOURCE_ORG" "$name") || { nb='?'; rc=1; }
+    na=${SNAP_DTB[$name]:-}
+    [[ -n $na ]] || na=$(count_branches "$TARGET_ORG" "$name") || { na='?'; rc=1; }
+  fi
   state=${st%%:*}
   case $state in
     fork)  if [[ $st == fork:"$SOURCE_ORG/$name" ]]; then note="upstream=$SOURCE_ORG"
@@ -760,9 +940,10 @@ status_one() { # one row -> "state<TAB>na<TAB>nb<TAB>note" in $RUN_DIR/status.<n
 
 cmd_status() {
   load_token
-  build_target_index
+  org_index_worth && build_target_index || true
   local rows name rest archived isfork parent def priv size state counts note nb na first=1 f
   rows=$(target_rows) || die "cannot list $SOURCE_ORG"
+  build_ref_snapshot <<<"$(cut_names "$rows")"
   printf '%s\n' "$rows" | run_pool status_one      # was a serial loop: same calls as verify, 4x slower
   if [[ $JSON_OUT == 1 ]]; then printf '['
   else printf '%-44s %-8s %-9s %s\n' "${bold}REPO${off}" "${bold}STATE${off}" "${bold}BRANCHES${off}" "${bold}NOTE${off}"; fi
@@ -797,12 +978,14 @@ cmd_status() {
 cmd_verify() {
   load_token
   single_run_guard
-  if [[ -z ${ALL:-} ]]; then
-    build_snapshot                              # default branches: 2 GraphQL calls replace 132 REST calls
-  else
-    build_target_index
+  if [[ -z ${ALL:-} ]] && org_index_worth; then
+    build_snapshot                    # default branches: 2 GraphQL calls replace 132 REST calls
   fi
   local rows; rows=$(target_rows)
+  if [[ ${HAVE_INDEX:-0} != 1 ]] && org_index_worth; then build_target_index; fi
+  if [[ -n ${ALL:-} ]]; then
+    build_ref_snapshot <<<"$(cut_names "$rows")"   # every ref of every repo, batched
+  fi
   : >"$STATE_DIR/drift.tsv"
   say "${bold}$SOURCE_ORG${off} vs ${bold}$TARGET_ORG${off} - comparing ${ALL:-default branches}${ALL:+ of every branch}   ${dim}drift list: $STATE_DIR/drift.tsv${off}"
   printf '%s\n' "$rows" | run_pool verify_one
@@ -814,7 +997,7 @@ cmd_verify() {
 verify_one() { # one row -> compares branch head SHAs (2 calls per repo, 4 with -a)
   local name archived isfork parent def priv size st n=0 bad=0 ref sha tsha up tp
   IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
-  up=$STATE_DIR/vup.$name.tmp; tp=$STATE_DIR/vdst.$name.tmp
+  up=$RUN_DIR/vup.$name; tp=$RUN_DIR/vdst.$name
   st=$(target_state "$name")
   if [[ $st == none ]]; then
     if [[ $archived == true || ${size:-0} == 0 ]]; then
@@ -822,6 +1005,10 @@ verify_one() { # one row -> compares branch head SHAs (2 calls per repo, 4 with 
     fi
     printf '%s\t%s\t%s\n' "$name" "-" "missing" >>"$STATE_DIR/drift.tsv"
     emit "  ${red}missing${off}    $name"; flush; return 1
+  fi
+  local snap; snap=${SNAP_CLEAN[$name]:-}
+  if [[ -n $snap ]]; then                    # the batched snapshot proved every ref identical
+    emit "  ${grn}ok${off}         $name ${dim}${snap} branch(es) identical${off}"; flush; return 0
   fi
   # default-branch mode (no -a): one head per side, nothing paginated, so a 370 branch
   # repo costs exactly the same as a 1 branch repo.
@@ -932,6 +1119,8 @@ cmd_config() {
   printf '%-20s %s\n' 'ratelimit_max_wait' "$RL_MAX_SLEEP"
   printf '%-20s %s\n' 'curl timeouts' "connect ${CURL_CONNECT_TIMEOUT}s, total ${CURL_MAX_TIME}s"
   printf '%-20s %s\n' 'dump_api_responses' "$( (( DUMP_API )) && echo 'on -> files under run/<pid>/' || echo 'off (responses kept in memory)' )"
+  printf '%-20s %s\n' 'ref_snapshot' "$([[ $REF_SNAPSHOT == 1 ]] && echo "on ($SNAP_CHUNK repos per GraphQL request)" || echo off)"
+  printf '%-20s %s\n' 'index_min_repos' "$INDEX_MIN (below this, per repo lookups skip the org index)"
   printf '%-20s %s\n' 'log_api_calls' "$( (( LOG_API )) && echo "on -> $LOG_FILE" || echo off )"
   return 0
 }
