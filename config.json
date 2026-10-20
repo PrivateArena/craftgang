@@ -1,0 +1,28 @@
+{
+  "_comment": "craftgang.sh settings. Precedence: CLI flags > environment > this file > built-in defaults. Run ./craftgang.sh config to see what is actually in use.",
+
+  "source_org": "storytold",
+  "target_org": "CraftGang",
+
+  "api": "https://api.github.com",
+  "git_host": "github.com",
+  "ssh_key": "/home/jang/.ssh/id_ed25519_GunGunGun",
+  "state_dir": ".craftgang",
+
+  "parallel": {
+    "read": 12,
+    "write": 8
+  },
+
+  "fork_spacing": 20,
+  "fork_timeout": 900,
+  "ratelimit_max_wait": 300,
+
+  "curl": {
+    "connect_timeout": 10,
+    "max_time": 60
+  },
+
+  "dump_api_responses": false,
+  "log_api_calls": true
+}

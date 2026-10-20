@@ -14,27 +14,90 @@
 set -uo pipefail
 
 # ------------------------------- configuration ----------------------------
+# Everything in this block is a fallback. Real settings belong in config.json next to
+# the script (or -c FILE / $CRAFTGANG_CONFIG), so the tool stays a generic "mirror one
+# GitHub owner into another" script instead of being tied to a single pair of orgs.
+# Precedence: command line  >  environment  >  config.json  >  built-in default.
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-SOURCE_ORG=${CRAFTGANG_SOURCE:-storytold}      # upstream, mirrored from
-TARGET_ORG=${CRAFTGANG_TARGET:-CraftGang}      # ours, mirrored into
-API=${CRAFTGANG_API:-https://api.github.com}
-GIT_HOST=${CRAFTGANG_GIT_HOST:-github.com}
-SSH_KEY=${CRAFTGANG_SSH_KEY:-$HOME/.ssh/id_ed25519_GunGunGun}
-STATE_DIR=${CRAFTGANG_STATE:-$SCRIPT_DIR/.craftgang}
+CONFIG_FILE=${CRAFTGANG_CONFIG:-$SCRIPT_DIR/config.json}
+CONFIG_EXPLICIT=${CRAFTGANG_CONFIG:+1}
+CFG_JSON=''
 SEP=$'\037'                              # field separator for repo rows (tab would collapse empties)
-LOG_FILE=$STATE_DIR/craftgang.log
-PARALLEL=${CRAFTGANG_PARALLEL:-}               # empty -> picked per command below (see CMD_ARG)
-READ_PARALLEL=${CRAFTGANG_READ_PARALLEL:-12}   # concurrency for GET-only commands
-WRITE_PARALLEL=${CRAFTGANG_WRITE_PARALLEL:-4}  # concurrency for sync/mirror (write points = secondary limit)
-FORK_TIMEOUT=${CRAFTGANG_FORK_TIMEOUT:-900}    # seconds a fork may take to appear
-FORK_SPACING=${CRAFTGANG_FORK_SPACING:-20}     # seconds between fork creations (API limit)
-RL_MAX_SLEEP=${CRAFTGANG_RATELIMIT_WAIT:-300}   # cap for rate limit backoff
-CURL_CONNECT_TIMEOUT=${CRAFTGANG_CONNECT_TIMEOUT:-10}
-CURL_MAX_TIME=${CRAFTGANG_MAX_TIME:-60}
-
-CMD=sync DRY=0 FORCE=0 PRUNE=0 TAGS=1 SKIP_ARCH=0 JSON_OUT=0 QUIET=0 ALLOW_DISK=0 KEEP_MIRRORS=1
-declare -a ONLY=() EXCL=()
 API_STATUS=0
+CMD=sync DRY=0 FORCE=0 PRUNE=0 TAGS=1 SKIP_ARCH=0 JSON_OUT=0 QUIET=0 ALLOW_DISK=0 KEEP_MIRRORS=1 HELP=0
+declare -a ONLY=() EXCL=()
+CLI_SOURCE='' CLI_TARGET='' CLI_PARALLEL=''
+
+cfg_get() { # cfg_get dotted.key -> string form of that config.json value, empty if unset
+  [[ -n $CFG_JSON ]] || return 0
+  jq -r --arg p "$1" 'getpath($p | split(".")) as $v
+    | if $v == null then "" elif ($v | type) == "string" then $v else ($v | tostring) end' <<<"$CFG_JSON" 2>/dev/null
+}
+
+resolve() { # resolve CLI_VALUE ENV_NAME CONFIG_KEY DEFAULT -> first source that sets it
+  local v=$1
+  [[ -n $v ]] || v=${!2:-}
+  [[ -n $v ]] || v=$(cfg_get "$3")
+  printf '%s\n' "${v:-$4}"
+}
+
+yes_no() { [[ ${1,,} =~ ^(1|true|yes|on)$ ]] && echo 1 || echo 0; }
+
+load_config() {
+  if [[ -f $CONFIG_FILE ]]; then
+    CFG_JSON=$(<"$CONFIG_FILE")
+    jq -e . <<<"$CFG_JSON" >/dev/null 2>&1 || die "config: $CONFIG_FILE is not valid JSON"
+  elif [[ -n $CONFIG_EXPLICIT ]]; then
+    die "no such config file: $CONFIG_FILE"
+  fi
+  return 0
+}
+
+state_path() { # keep relative config paths next to the script, so cron gets them too
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *)  printf '%s/%s\n' "$SCRIPT_DIR" "$1" ;;
+  esac
+}
+
+configure() { # resolve settings, then build everything that depends on them
+  load_config
+  SOURCE_ORG=$(resolve "$CLI_SOURCE" CRAFTGANG_SOURCE source_org '')
+  TARGET_ORG=$(resolve "$CLI_TARGET" CRAFTGANG_TARGET target_org '')
+  [[ -n $SOURCE_ORG && -n $TARGET_ORG ]] || die "source_org and target_org are not set.
+  Put them in $CONFIG_FILE (see --help), or pass --source/--target."
+  API=$(resolve '' CRAFTGANG_API api https://api.github.com)
+  GIT_HOST=$(resolve '' CRAFTGANG_GIT_HOST git_host github.com)
+  SSH_KEY=$(resolve '' CRAFTGANG_SSH_KEY ssh_key '')   # empty = let ssh pick from the agent/config
+  STATE_DIR=$(state_path "$(resolve '' CRAFTGANG_STATE state_dir "$SCRIPT_DIR/.craftgang")")
+  LOG_FILE=$STATE_DIR/craftgang.log
+  READ_PARALLEL=$(resolve '' CRAFTGANG_READ_PARALLEL parallel.read 12)
+  WRITE_PARALLEL=$(resolve '' CRAFTGANG_WRITE_PARALLEL parallel.write 4)
+  PARALLEL=$(resolve "$CLI_PARALLEL" CRAFTGANG_PARALLEL parallel.all '')   # set = same width for every command
+  FORK_TIMEOUT=$(resolve '' CRAFTGANG_FORK_TIMEOUT fork_timeout 900)
+  FORK_SPACING=$(resolve '' CRAFTGANG_FORK_SPACING fork_spacing 20)
+  RL_MAX_SLEEP=$(resolve '' CRAFTGANG_RATELIMIT_WAIT ratelimit_max_wait 300)
+  CURL_CONNECT_TIMEOUT=$(resolve '' CRAFTGANG_CONNECT_TIMEOUT curl.connect_timeout 10)
+  CURL_MAX_TIME=$(resolve '' CRAFTGANG_MAX_TIME curl.max_time 60)
+  # responses stay in shell variables; files are only written when explicitly asked for
+  DUMP_API=$(yes_no "$(resolve '' CRAFTGANG_DUMP_API dump_api_responses 0)")
+  LOG_API=$(yes_no "$(resolve '' CRAFTGANG_LOG_API log_api_calls 1)")
+  # prefetch all branch/tag maps in a few batched GraphQL calls instead of 4 REST calls per repo
+  REF_SNAPSHOT=$(yes_no "$(resolve '' CRAFTGANG_REF_SNAPSHOT ref_snapshot 1)")
+  SNAP_CHUNK=$(resolve '' CRAFTGANG_SNAP_CHUNK ref_snapshot_chunk 15)
+  case $CMD in status|verify|plan) [[ -n ${PARALLEL:-} ]] || PARALLEL=$READ_PARALLEL ;;
+                  *)               [[ -n ${PARALLEL:-} ]] || PARALLEL=$WRITE_PARALLEL ;; esac
+  mkdir -p "$STATE_DIR/mirrors" "$STATE_DIR/run"
+  # One temp directory per invocation. The old global `rm -f $STATE_DIR/body.*` at startup
+  # let a manual `status` delete a running cron `sync`'s in-flight API responses.
+  RUN_DIR=$STATE_DIR/run/$$
+  TARGET_INDEX=$RUN_DIR/target.tsv SOURCE_INDEX=$RUN_DIR/source.tsv
+  HAVE_INDEX=0 HAVE_SNAPSHOT=0
+  mkdir -p "$RUN_DIR"
+  trap 'rm -rf "${RUN_DIR:?}"' EXIT
+  find "$STATE_DIR/run" -mindepth 1 -maxdepth 1 -type d -mmin +180 -exec rm -rf {} + 2>/dev/null || :
+  return 0
+}
 
 # ---------------------------------- output --------------------------------
 bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' grn=$'\e[32m' ylw=$'\e[33m' blu=$'\e[34m' off=$'\e[0m'
@@ -57,6 +120,7 @@ ${bold}Commands${off}
   status              per-repo table: missing / fork / branch coverage
   verify              compare branch SHAs with upstream, exit 1 on drift (default branch;
                       -a compares every branch)     
+  config              show the resolved configuration (config.json + env + defaults)
   mirror              disk fallback (git clone --mirror + push --mirror) for repos
                       GitHub refuses to fork (archived, fork-count limits)
   auth                show token identity, scopes and access to $TARGET_ORG
@@ -76,6 +140,7 @@ ${bold}Options${off}
   -q, --quiet            log only
       --keep-disk        allow "mirror" to run over every repo (needs disk)
   -K, --no-keep          delete the cached bare mirror after pushing
+  -c, --config FILE      settings file (default: config.json next to the script)
       --source ORG       upstream org        (default $SOURCE_ORG)
       --target ORG       destination org/user (default $TARGET_ORG)
   -h, --help             this text
@@ -85,11 +150,11 @@ EOF
 # --------------------------------- parsing --------------------------------
 while [[ $# -gt 0 ]]; do
   case $1 in
-    sync|plan|status|verify|mirror|auth|clean) CMD=$1 ;;
+    sync|plan|status|verify|mirror|auth|clean|config) CMD=$1 ;;
     token|schedule)  CMD=$1; shift; CMD_ARG=${1:-}; continue ;;
     -r|--repo)    ONLY+=("$2"); shift ;;
     -x|--exclude) EXCL+=("$2"); shift ;;
-    -j|--parallel) PARALLEL=$2; shift ;;
+    -j|--parallel) CLI_PARALLEL=$2; shift ;;
     -f|--force)   FORCE=1 ;;
     --prune)      PRUNE=1 ;;
     --no-tags)    TAGS=0 ;;
@@ -99,59 +164,60 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet)   QUIET=1 ;;
     --keep-disk)  ALLOW_DISK=1 ;;
     -K|--no-keep) KEEP_MIRRORS=0 ;;
-    --source)     SOURCE_ORG=$2; shift ;;
-    --target)     TARGET_ORG=$2; shift ;;
+    -c|--config)  CONFIG_FILE=$2 CONFIG_EXPLICIT=1; shift ;;
+    --source)     CLI_SOURCE=$2; shift ;;
+    --target)     CLI_TARGET=$2; shift ;;
     -n|--dry-run) DRY=1; CMD=plan ;;
-    -h|--help)    usage; exit 0 ;;
+    -h|--help)    HELP=1 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
 CMD_ARG=${CMD_ARG:-}
-# read-only commands issue nothing but GETs, so they can fan out wider without
-# touching the write-side secondary limits that keep sync at WRITE_PARALLEL
-if [[ -z ${PARALLEL:-} ]]; then
-  case $CMD in status|verify|plan) PARALLEL=$READ_PARALLEL ;; *) PARALLEL=$WRITE_PARALLEL ;; esac
-fi
-
-# One temp directory per invocation. The old global `rm -f $STATE_DIR/body.*` at
-# startup let a manual `status` delete a running cron `sync`'s in-flight API
-# responses, which then looked like empty ref listings (and pruned real refs).
-RUN_DIR=$STATE_DIR/run/$$
-TARGET_INDEX=$RUN_DIR/target.tsv SOURCE_INDEX=$RUN_DIR/source.tsv
-HAVE_INDEX=0 HAVE_SNAPSHOT=0
-mkdir -p "$STATE_DIR/mirrors" "$RUN_DIR"
-trap 'rm -rf "${RUN_DIR:?}"' EXIT
-find "$STATE_DIR/run" -mindepth 1 -maxdepth 1 -type d -mmin +180 -exec rm -rf {} + 2>/dev/null || :
+configure
+(( HELP )) && { usage; exit 0; }
 
 # ------------------------------------ HTTP --------------------------------
-J() { [[ -n ${RESP:-} && -f $RESP ]] || return 1; jq -r "$1" "$RESP" 2>/dev/null; }
+J() { [[ -n ${RESP_BODY:-} ]] || return 1; jq -r "$1" <<<"$RESP_BODY" 2>/dev/null; }
 
-api_raw() { # api_raw METHOD PATH [JSON] -> API_STATUS, body path in $RESP
-  local method=$1 path=$2 data=${3:-} code args attempt wait
-  local BODY_FILE=$RUN_DIR/body.$BASHPID HDR_FILE=$RUN_DIR/headers.$BASHPID
-  RESP=$BODY_FILE HDRC=$HDR_FILE          # inherited by $() children, unique per process
+jqb() { jq "$@" <<<"$RESP_BODY"; }   # jq over the body of the last api_raw call
+
+# Responses are kept in shell variables: nothing is written to .craftgang per call
+# unless dump_api_responses is turned on. One curl -D - -o - stream carries the header
+# block, a blank line, then the body, so no temp file and no -w marker is needed.
+api_raw() { # api_raw METHOD PATH [JSON] -> API_STATUS, body in $RESP_BODY, headers in $RESP_HDR
+  local method=$1 path=$2 data=${3:-} raw code attempt wait
+  local args
+  RESP_BODY='' RESP_HDR=''
   for attempt in 1 2 3 4; do
-    args=(-sS -o "$BODY_FILE" -D "$HDR_FILE" -w '%{http_code}' -X "$method"
+    args=(-sS -D - -o - -X "$method"
           --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME"
           -H "Authorization: Bearer $TOKEN"
           -H "Accept: application/vnd.github+json"
           -H "X-GitHub-Api-Version: 2022-11-28")
     [[ -n $data ]] && args+=(-H "Content-Type: application/json" --data "$data")
-    code=$(curl "${args[@]}" "$API$path" 2>>"$LOG_FILE") || {
+    raw=$(curl "${args[@]}" "$API$path" 2>>"$LOG_FILE") || {
       # transport failure: back off, but never on the last attempt (that 12 s bought nothing)
       (( attempt < 4 )) && sleep $((attempt * 3)); continue; }
+    RESP_HDR=${raw%%$'\r\n\r\n'*}
+    RESP_BODY=${raw#*$'\r\n\r\n'}
+    [[ ${#RESP_BODY} -ge ${#raw} ]] && RESP_BODY=''          # no header/body separator at all
+    code=$(awk '$1 ~ /^HTTP\// { c = $2 } END { print c + 0 }' <<<"$RESP_HDR")
     API_STATUS=$code
+    if (( DUMP_API )); then                                  # diagnostics only; readers use the variables
+      printf '%s' "$RESP_BODY" >"$RUN_DIR/body.$BASHPID"
+      printf '%s' "$RESP_HDR" >"$RUN_DIR/headers.$BASHPID"
+    fi
     # only genuine rate limits are retried here - other 4xx are real answers
-    if [[ $code == 429 || $code == 403 ]] && grep -qi 'rate limit\|abuse detection' "$BODY_FILE" 2>/dev/null; then
-      wait=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2}' "$HDR_FILE")
-      [[ -z $wait ]] && wait=$(awk -v now="$(date +%s)" 'tolower($1)=="x-ratelimit-reset:"{gsub(/\r/,"",$2); d=$2-now; print (d>0?d:1)}' "$HDR_FILE")
+    if [[ $code == 429 || $code == 403 ]] && grep -qi 'rate limit\|abuse detection' <<<"$RESP_BODY"; then
+      wait=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2}' <<<"$RESP_HDR")
+      [[ -z $wait ]] && wait=$(awk -v now="$(date +%s)" 'tolower($1)=="x-ratelimit-reset:"{gsub(/\r/,"",$2); d=$2-now; print (d>0?d:1)}' <<<"$RESP_HDR")
       : "${wait:=60}"; (( wait > RL_MAX_SLEEP )) && wait=$RL_MAX_SLEEP
       (( attempt < 4 )) || break          # do not sleep 300 s just to return a failure
       warn "rate limited on $method $path - sleeping ${wait}s"
       sleep "$wait"; continue
     fi
-    log "$code $method $path"
+    (( LOG_API )) && log "$code $method $path"
     return 0
   done
   return 1
@@ -182,7 +248,7 @@ cmd_auth() {
   [[ $API_STATUS == 200 ]] || die "token from $TOKEN_SRC rejected (HTTP $API_STATUS): $(J .message)"
   local me; me=$(J .login)
   say "identity   : ${bold}$me${off}  ${dim}($TOKEN_SRC, $(J .type))${off}"
-  say "scopes     : $(grep -i '^x-oauth-scopes:' "$HDRC" | cut -d' ' -f2- | tr -d '\r')"
+  say "scopes     : $(grep -i '^x-oauth-scopes:' <<<"$RESP_HDR" | cut -d' ' -f2- | tr -d '\r')"
   api_raw GET "/orgs/$TARGET_ORG/members/$me"
   case $API_STATUS in
     204) say "target     : ${grn}$TARGET_ORG - member${off}" ;;
@@ -198,13 +264,17 @@ cmd_auth() {
 
 # -------------------------------- discovery -------------------------------
 source_repos() { # name<TAB>archived<TAB>fork<TAB>parent<TAB>default<TAB>private<TAB>size_kb
-  local page=1 n
+  local page=1 n path="/orgs/$SOURCE_ORG/repos?type=all&sort=full_name"
   while :; do
-    api_raw GET "/orgs/$SOURCE_ORG/repos?per_page=100&type=all&sort=full_name&page=$page" || return 1
+    api_raw GET "$path&per_page=100&page=$page" || return 1
+    if [[ $API_STATUS == 404 && $page == 1 && $path == /orgs/* ]]; then
+      path="/users/$SOURCE_ORG/repos?type=owner&sort=full_name"   # a plain user login, not an org
+      api_raw GET "$path&per_page=100&page=1" || return 1
+    fi
     [[ $API_STATUS == 200 ]] || { warn "list $SOURCE_ORG: HTTP $API_STATUS $(J .message)"; return 1; }
-    n=$(jq 'length' "$RESP")
+    n=$(jqb 'length')
     [[ ${n:-0} == 0 ]] && break
-    jq -r --arg s "$SEP" '.[] | [.name,(.archived|tostring),(.fork|tostring),(.parent.full_name // ""),.default_branch,(.private|tostring),(.size|tostring)] | join($s)' "$RESP"
+    jqb -r --arg s "$SEP" '.[] | [.name,(.archived|tostring),(.fork|tostring),(.parent.full_name // ""),.default_branch,(.private|tostring),(.size|tostring)] | join($s)'
     [[ $n -lt 100 ]] && break
     page=$((page + 1))
   done
@@ -266,13 +336,13 @@ build_repo_index() { # ORG FILE -> name<TAB>isFork<TAB>parent<TAB>defBranch<TAB>
     api_raw POST "/graphql" "$(jq -nc --arg q "$REPO_INDEX_QUERY" --arg o "$owner" --arg c "$cursor" \
                '{query:$q,variables:{owner:$o,cursor:(if $c == "" then null else $c end)}}')" || break
     [[ $API_STATUS == 200 ]] || { warn "$owner index: HTTP $API_STATUS $(J .message)"; break; }
-    (( $(jq -r 'if .errors then (.errors | length) else 0 end' "$RESP") )) && { warn "$owner index: $(J .errors[0].message)"; break; }
-    [[ $(jq -r '.data.repositoryOwner == null' "$RESP") == true ]] && { warn "$owner is not visible to this token"; break; }
-    jq -r '.data.repositoryOwner.repositories.nodes[]
+    (( $(jqb -r 'if .errors then (.errors | length) else 0 end') )) && { warn "$owner index: $(J .errors[0].message)"; break; }
+    [[ $(jqb -r '.data.repositoryOwner == null') == true ]] && { warn "$owner is not visible to this token"; break; }
+    jqb -r '.data.repositoryOwner.repositories.nodes[]
       | [.name,(.isFork|tostring),(.parent.nameWithOwner // "-"),
-         (.defaultBranchRef.name // "-"),(.defaultBranchRef.target.oid // "-")] | @tsv' "$RESP" >>"$file"
-    [[ $(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' "$RESP") == true ]] || break
-    cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor // ""' "$RESP")
+         (.defaultBranchRef.name // "-"),(.defaultBranchRef.target.oid // "-")] | @tsv' >>"$file"
+    [[ $(jqb -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage') == true ]] || break
+    cursor=$(jqb -r '.data.repositoryOwner.repositories.pageInfo.endCursor // ""')
     [[ -n $cursor ]] || break
   done
   [[ -s $file ]]
@@ -315,10 +385,10 @@ create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
     201|202) ;;
     422) emit "  ${red}refused${off}    $name - $(J .message)"; return 2 ;;
     403|429)
-      if grep -qi 'empty repositor\|no git content' "$RESP" 2>/dev/null; then
+      if grep -qi 'empty repositor\|no git content' <<<"$RESP_BODY"; then
         emit "  ${dim}empty${off}      $name ${dim}(upstream has no commits - nothing to mirror)${off}"; return 4
       fi
-      if grep -qi 'rate limit\|abuse' "$RESP" 2>/dev/null; then
+      if grep -qi 'rate limit\|abuse' <<<"$RESP_BODY"; then
         note_deferred "$name"; emit "  ${ylw}deferred${off}   $name ${dim}fork throttled - next run will retry${off}"; return 3
       fi
       emit "  ${red}refused${off}    $name - $(J .message)"; return 2 ;;
@@ -333,7 +403,7 @@ create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
     # visible is not the same as populated: refs must actually have been copied across,
     # otherwise the branch/tag sync below runs against an empty fork
     api_raw GET "/repos/$TARGET_ORG/$name/branches?per_page=1"
-    [[ $API_STATUS == 200 && $(jq 'length' "$RESP") != 0 ]] && { emit "  ${grn}created${off}    $name ${dim}${waited}s${off}"; return 0; }
+    [[ $API_STATUS == 200 && $(jqb 'length') != 0 ]] && { emit "  ${grn}created${off}    $name ${dim}${waited}s${off}"; return 0; }
   done
   warn "fork $name not visible after ${FORK_TIMEOUT}s"
   note_deferred "$name"
@@ -378,9 +448,9 @@ count_branches() { # ORG NAME -> branch count in ONE call (per_page=1 + Link rel
   esac
   # at per_page=1 the last page number *is* the item count, so a 370 branch repo
   # (vectorcraft) costs the same single tiny call as a 1 branch repo
-  last=$(tr -d '\r' <"$HDRC" | sed -n 's/.*[?&]page=\([0-9]*\)>; rel="last".*/\1/p' | head -1)
+  last=$(tr -d '\r' <<<"$RESP_HDR" | sed -n 's/.*[?&]page=\([0-9]*\)>; rel="last".*/\1/p' | head -1)
   [[ -n $last ]] && { echo "$last"; return 0; }
-  jq 'length' "$RESP"
+  jqb 'length'
   return 0
 }
 # NOTE: /git/refs/* ignores ?page= (it keeps returning the first page), so the
@@ -392,9 +462,9 @@ ref_map() { # ref_map ORG NAME -> "refs/heads/<name><TAB>sha" for every branch
   while :; do
     api_raw GET "/repos/$org/$name/branches?per_page=100&page=$page" || return 1
     [[ $API_STATUS == 200 ]] || { warn "$org/$name branches: HTTP $API_STATUS $(J .message)"; return 1; }
-    n=$(jq 'length' "$RESP")
+    n=$(jqb 'length')
     [[ ${n:-0} == 0 ]] && break
-    jq -r --arg p "refs/heads/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
+    jqb -r --arg p "refs/heads/" '.[] | [$p + .name, .commit.sha] | @tsv'
     [[ $n -lt 100 ]] && break
     page=$((page + 1))
   done
@@ -406,9 +476,9 @@ tag_map() { # tag_map ORG NAME -> "refs/tags/<name><TAB>commit sha"
   while :; do
     api_raw GET "/repos/$org/$name/tags?per_page=100&page=$page" || return 1
     [[ $API_STATUS == 200 ]] || { warn "$org/$name tags: HTTP $API_STATUS $(J .message)"; return 1; }
-    n=$(jq 'length' "$RESP")
+    n=$(jqb 'length')
     [[ ${n:-0} == 0 ]] && break
-    jq -r --arg p "refs/tags/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
+    jqb -r --arg p "refs/tags/" '.[] | [$p + .name, .commit.sha] | @tsv'
     [[ $n -lt 100 ]] && break
     page=$((page + 1))
   done
@@ -491,7 +561,13 @@ force_sha() { # NAME REF UP_SHA CUR_SHA -> hard reset (or create) the mirror ref
   [[ $DRY == 1 ]] && { echo "would-force"; return; }
   if [[ -z $cur ]]; then echo "$(create_ref "$name" "$ref" "$sha")"; return; fi
   api_raw PATCH "/repos/$TARGET_ORG/$name/git/refs/${ref#refs/}" "$(jq -nc --arg s "$sha" '{sha:$s,force:true}')"
-  [[ $API_STATUS == 200 ]] && echo "forced:${cur:0:7}->${sha:0:7}" || echo "force-failed:$(J .message)"
+  case $API_STATUS in
+    200) echo "forced:${cur:0:7}->${sha:0:7}" ;;
+    # GitHub answers "Not Found" when the target commit is not reachable in the fork, so
+    # the objects still have to be pushed over git - no API call can create them
+    404) echo "needs-mirror:$ref" ;;
+    *)   echo "force-failed:$(J .message)" ;;
+  esac
 }
 
 
@@ -597,10 +673,11 @@ sync_one() { # one row from source_repos
     http*) emit "  ${red}error${off}      $name - $st"; flush; return 1 ;;
     plain) emit "  ${dim}plain repo${off}   $name - refs pushed server side" ;;
   esac
-  local b act note n=0 up=0 cur=0 bad=0
+  local b act note n=0 up=0 cur=0 bad=0 need_mirror=0
   while IFS=$'\t' read -r b act note; do
     [[ -z ${b:-} ]] && continue
     n=$((n + 1))
+    [[ $act == needs-mirror ]] && need_mirror=1
     case $act in
       synced|forced|would-sync|would-force) up=$((up + 1)); emit "    ${grn}$act${off} ${b} ${dim}${note}${off}" ;;
       upto-date) cur=$((cur + 1)) ;;
@@ -608,7 +685,10 @@ sync_one() { # one row from source_repos
     esac
   done <<<"$(sync_branches "$name")"
   emit "  ${grn}ok${off}         $name ${dim}${n} branches | ${up} updated | ${cur} current${off}"
-  (( bad )) && emit "  ${red}stale${off}      $name ${bad} branch(es) need --force or manual review"
+  if (( bad )); then
+    (( need_mirror )) && emit "  ${ylw}needs-mirror${off} $name ${bad} branch(es) need a git push: ./craftgang.sh mirror -r $name" \
+                      || emit "  ${red}stale${off}      $name ${bad} branch(es) need --force or manual review"
+  fi
 
   if [[ $TAGS == 1 ]]; then
     local t a s
@@ -805,7 +885,7 @@ verify_one() { # one row -> compares branch head SHAs (2 calls per repo, 4 with 
 
 mirror_repo() { # disk fallback for what the API cannot do (new objects, >fork limits)
   local name=$1 dir=$STATE_DIR/mirrors/$name.git url=git@$GIT_HOST:$TARGET_ORG/$name.git
-  export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o BatchMode=yes"
+  export GIT_SSH_COMMAND="ssh -o BatchMode=yes$( [[ -n $SSH_KEY ]] && printf ' -i %s -o IdentitiesOnly=yes' "$SSH_KEY" )"
   if [[ -d $dir ]]; then
     say "  ${blu}update${off} $name ${dim}(incremental fetch)${off}"
     git -C "$dir" remote update --prune >/dev/null || { warn "fetch $name failed"; return 1; }
@@ -833,6 +913,27 @@ cmd_mirror() {
     exit 2
   fi
   while IFS=$SEP read -r name rest; do [[ -n ${name:-} ]] && mirror_repo "$name"; done <<<"$rows"
+}
+
+cmd_config() {
+  printf '%-20s %s\n' "${bold}setting${off}" "${bold}value${off}"
+  printf '%-20s %s\n' 'config file' "${CONFIG_FILE}$( [[ -f $CONFIG_FILE ]] || printf '  (absent - env and defaults in use)')"
+  printf '%-20s %s\n' 'source_org' "$SOURCE_ORG"
+  printf '%-20s %s\n' 'target_org' "$TARGET_ORG"
+  printf '%-20s %s\n' 'api' "$API"
+  printf '%-20s %s\n' 'git_host' "$GIT_HOST"
+  printf '%-20s %s\n' 'ssh_key' "${SSH_KEY:-<ssh agent / ~/.ssh/config>}"
+  printf '%-20s %s\n' 'state_dir' "$STATE_DIR"
+  printf '%-20s %s\n' 'parallel.read' "$READ_PARALLEL"
+  printf '%-20s %s\n' 'parallel.write' "$WRITE_PARALLEL"
+  printf '%-20s %s\n' 'this command' "$PARALLEL concurrent repositories"
+  printf '%-20s %s\n' 'fork_spacing' "$FORK_SPACING"
+  printf '%-20s %s\n' 'fork_timeout' "$FORK_TIMEOUT"
+  printf '%-20s %s\n' 'ratelimit_max_wait' "$RL_MAX_SLEEP"
+  printf '%-20s %s\n' 'curl timeouts' "connect ${CURL_CONNECT_TIMEOUT}s, total ${CURL_MAX_TIME}s"
+  printf '%-20s %s\n' 'dump_api_responses' "$( (( DUMP_API )) && echo 'on -> files under run/<pid>/' || echo 'off (responses kept in memory)' )"
+  printf '%-20s %s\n' 'log_api_calls' "$( (( LOG_API )) && echo "on -> $LOG_FILE" || echo off )"
+  return 0
 }
 
 cmd_token() {
@@ -872,6 +973,7 @@ case $CMD in
   sync)     cmd_sync ;;
   plan)     DRY=1; cmd_sync ;;
   status)   cmd_status ;;
+  config)   cmd_config ;;
   verify)   cmd_verify ;;
   mirror)   cmd_mirror ;;
   auth)     cmd_auth ;;

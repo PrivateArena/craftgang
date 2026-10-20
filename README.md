@@ -27,7 +27,11 @@ sides) and issue per-ref calls only for refs that actually differ.
 | `verify` | ~10 s | 4 | two GraphQL org snapshots (default branch heads) |
 | `verify -a` | ~29 s | ~169 | every-branch SHA comparison, paginated per repo |
 | `status` | ~10 s | ~134 | GraphQL index + one tiny count call per repo per side |
-| `plan` / `sync` (no changes) | ~30 s | ~261 | ref listings on both sides, at `CRAFTGANG_WRITE_PARALLEL` |
+| `plan` / `sync` (no changes) | ~31 s | ~261 | ref listings on both sides, at `parallel.write` |
+
+`parallel.write` was measured on this org: 47 s at width 4, 35 s at 6, 31 s at 8 and no
+further gain at 12 - the remaining time is ~261 sequential-latency round trips, not CPU
+(user + sys under 7 s). Going below that needs fewer calls, not more concurrency.
 
 ## Requirements
 
@@ -48,6 +52,47 @@ sides) and issue per-ref calls only for refs that actually differ.
 Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
 `.craftgang/token` → `./craftgang.token` → `gh auth token`.
 
+## Configuration
+
+Settings live in `config.json` next to the script, so nothing here is tied to one pair of
+organisations: point `source_org` / `target_org` at any two GitHub owners (an org or a
+plain user login both work) and the same script mirrors that instead.
+
+```json
+{ "source_org": "storytold", "target_org": "CraftGang", "dump_api_responses": false }
+```
+
+Precedence: **command line > environment > `config.json` > built-in default.**
+
+```bash
+./craftgang.sh config                       # exactly what is in use, and from which file
+./craftgang.sh -c ~/mirrors/dsp.json status # a different mirror definition
+```
+
+| `config.json` key | env / flag override | default | meaning |
+| --- | --- | --- | --- |
+| `source_org` | `CRAFTGANG_SOURCE`, `--source` | - | owner mirrored **from** |
+| `target_org` | `CRAFTGANG_TARGET`, `--target` | - | owner mirrored **into** |
+| `api` | `CRAFTGANG_API` | `https://api.github.com` | REST + GraphQL base URL (works for GHES) |
+| `git_host` | `CRAFTGANG_GIT_HOST` | `github.com` | ssh host used by `mirror` |
+| `ssh_key` | `CRAFTGANG_SSH_KEY` | ssh agent / `~/.ssh/config` | explicit key for `mirror` only |
+| `state_dir` | `CRAFTGANG_STATE` | `./.craftgang` | token, log, per-run index files |
+| `parallel.read` | `CRAFTGANG_READ_PARALLEL` | `12` | repos in flight for `status`/`verify`/`plan` (GET only) |
+| `parallel.write` | `CRAFTGANG_WRITE_PARALLEL` | `8` | repos in flight for `sync`/`mirror` |
+| `parallel.all` | `CRAFTGANG_PARALLEL`, `-j` | - | force one width for every command |
+| `fork_spacing` | `CRAFTGANG_FORK_SPACING` | `20` | seconds between fork creations |
+| `fork_timeout` | `CRAFTGANG_FORK_TIMEOUT` | `900` | seconds to wait for a fork to appear |
+| `ratelimit_max_wait` | `CRAFTGANG_RATELIMIT_WAIT` | `300` | max backoff when rate limited |
+| `curl.connect_timeout` | `CRAFTGANG_CONNECT_TIMEOUT` | `10` | seconds |
+| `curl.max_time` | `CRAFTGANG_MAX_TIME` | `60` | seconds |
+| `dump_api_responses` | `CRAFTGANG_DUMP_API` | `false` | also write `body.*` / `headers.*` per API call, for debugging |
+| `log_api_calls` | `CRAFTGANG_LOG_API` | `true` | append one line per API call to `.craftgang/craftgang.log` |
+
+`dump_api_responses` is off by default because API responses are kept in shell
+variables: a normal run writes **no** per-call files into the state directory at all
+(`.craftgang/run/<pid>/` holds only the two index files for the run and is deleted on
+exit). Enabling it costs about two file writes per API call (~270 per full `status`).
+
 ## Usage
 
 ```bash
@@ -60,6 +105,8 @@ Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
 ./craftgang.sh sync --force             # always hard-reset refs, skip merge commits
 ./craftgang.sh sync --prune             # also delete branches/tags that upstream removed
 ./craftgang.sh verify -a -j 8           # 8 repos in flight
+./craftgang.sh config                    # resolved settings (config.json + env + defaults)
+./craftgang.sh -c other.json sync        # mirror a different org pair
 ./craftgang.sh schedule 6h              # keep it fresh: cron entry  "0 */6 * * *"
 ./craftgang.sh schedule clear
 ```
@@ -73,12 +120,13 @@ Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
   `default_branch_only:false`, so a fresh copy already carries every branch.
 * **Empty repositories cannot be forked** (`AniCraft` upstream has no commits).
   Reported as `empty`, skipped — 65/66 repos are mirrored because of this.
-* **A branch created upstream *after* the fork** may reference objects that do
-  not exist in the fork, so no API call can create it. The run reports
+* **A branch whose commits the fork does not have** - created upstream after the fork,
+  or rewritten by a force-push - cannot be created or reset by any API call, because
+  GitHub answers `Not Found` for an object it does not have. The run reports
   `needs-mirror` and `./craftgang.sh mirror -r NAME` (git, uses ~100 MB disk at
   most, cached under `.craftgang/mirrors`) closes that last gap.
 * **Fork creation is throttled** by GitHub; creations are serialised and spaced
-  by `CRAFTGANG_FORK_SPACING` (20 s default). Anything refused goes to
+  by `fork_spacing` (20 s default). Anything refused goes to
   `.craftgang/deferred` and is finished by the next run - only the first run is
   slow.
 * **Diverged branches are repaired automatically**: `merge-upstream` is tried
@@ -94,31 +142,16 @@ Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
   every mirrored branch; it also treated a failed listing as an empty one. Both are
   guarded now: a failed or empty upstream map aborts the prune for that repo.
 * **Read-only commands** (`status`, `verify`, `plan`) run 12 repositories at once; the
-  write path stays at 4, because `POST`/`PATCH`/`DELETE` count against GitHub's
-  per-minute write points, which `X-RateLimit-Remaining` does not expose.
-* Temporary API responses live in `.craftgang/run/<pid>/` and are deleted on exit, so a
-  manual `status` can no longer wipe the in-flight files of a scheduled `sync` (that
-  previously turned a live listing into an empty one). Directories older than 3 h are
-  swept by the next run.
+  write path uses 8, which is where the latency plateau was measured. `POST`/`PATCH`/
+  `DELETE` count against GitHub's per-minute write points (which
+  `X-RateLimit-Remaining` does not expose), so lower `parallel.write` towards 4 if a run
+  ever starts reporting 403s.
+* API responses are kept in shell variables, not files: a normal run creates nothing per
+  call. Only the two index files live in `.craftgang/run/<pid>/` (deleted on exit), so a
+  manual `status` can no longer wipe the in-flight responses of a scheduled `sync` -
+  which used to turn a live listing into an empty one. `dump_api_responses` re-enables
+  per-call `body.*`/`headers.*` files when a raw response has to be inspected.
 * Tags are copied by ref and annotated tag objects are preserved.
 * Concurrent runs are refused (`.craftgang/lock`); rate limits are honoured with
   backoff on `Retry-After` / `x-ratelimit-reset`.
 * State, logs and the token live in `.craftgang/` (git-ignored).
-
-## Environment overrides
-
-| variable | default | meaning |
-| --- | --- | --- |
-| `CRAFTGANG_SOURCE` | `storytold` | upstream org |
-| `CRAFTGANG_TARGET` | `CraftGang` | destination org (a user login also works) |
-| `CRAFTGANG_READ_PARALLEL` | `12` | repositories processed at once by `status`/`verify`/`plan` |
-| `CRAFTGANG_WRITE_PARALLEL` | `4` | repositories processed at once by `sync`/`mirror` |
-| `CRAFTGANG_PARALLEL` | - | overrides both of the above, for every command |
-| `CRAFTGANG_CONNECT_TIMEOUT` | `10` | curl connect timeout, seconds |
-| `CRAFTGANG_MAX_TIME` | `60` | curl total timeout, seconds |
-| `CRAFTGANG_FORK_SPACING` | `20` | seconds between fork creations |
-| `CRAFTGANG_FORK_TIMEOUT` | `900` | seconds to wait for a fork to appear |
-| `CRAFTGANG_RATELIMIT_WAIT` | `300` | max backoff on rate limits |
-| `CRAFTGANG_SSH_KEY` | `~/.ssh/id_ed25519_GunGunGun` | key used by `mirror` |
-| `CRAFTGANG_GIT_HOST` | `github.com` | git host for `mirror` |
-| `CRAFTGANG_STATE` | `./.craftgang` | state directory |
