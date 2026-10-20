@@ -14,9 +14,20 @@ multi-GB repos sync in seconds:
 | hard-reset a branch | `PATCH /repos/{org}/{repo}/git/refs/heads/{branch} {force:true}` | server-side `git push --force` |
 | add a branch/tag | `POST /repos/{org}/{repo}/git/refs` | server-side `git push` |
 
-Every run: 2 bulk calls per repo (`/branches` + `/tags` on both sides) to
-compare commit SHAs, and per-ref calls only for refs that actually differ.
-Measured full-organisation cost: **sync 36 s, verify 26 s**, ~350 API requests.
+Only the default branch is compared by `verify`; `-a` compares every branch. Full
+runs compare commit SHAs with 2 bulk calls per repo (`/branches` + `/tags` on both
+sides) and issue per-ref calls only for refs that actually differ.
+
+### Measured timings
+
+65 repositories, nothing to change (2026-10-20, this machine):
+
+| command | wall | API calls | where the time goes |
+| --- | --- | --- | --- |
+| `verify` | ~10 s | 4 | two GraphQL org snapshots (default branch heads) |
+| `verify -a` | ~29 s | ~169 | every-branch SHA comparison, paginated per repo |
+| `status` | ~10 s | ~134 | GraphQL index + one tiny count call per repo per side |
+| `plan` / `sync` (no changes) | ~30 s | ~261 | ref listings on both sides, at `CRAFTGANG_WRITE_PARALLEL` |
 
 ## Requirements
 
@@ -25,6 +36,9 @@ Measured full-organisation cost: **sync 36 s, verify 26 s**, ~350 API requests.
 * token scopes: classic `repo,read:org`, or fine-grained
   *Administration RW, Contents RW, Pull requests RW*
 * `curl`, `jq`, plus `git`/SSH only for the `mirror` fallback
+* read access to `POST /graphql` - the mirror-side repo index (fork parent, default
+  branch head) comes from one GraphQL query per 100 repositories, because the REST
+  repository listing does not return `parent` at all
 
 ```bash
 ./craftgang.sh auth                      # identity, scopes, access to the target org
@@ -73,6 +87,19 @@ Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
   Dependabot rewriting its own branches.
 * `/git/refs/*` ignores `?page=`, so all bulk comparisons use the paginated
   `/branches` and `/tags` listings (`/git/refs` would loop forever there).
+* A **branch count** is read from the `Link rel="last"` header of a `per_page=1`
+  request, so a 1302 branch repo costs the same single call as a 1 branch repo.
+* **`--prune` never trusts an unreadable listing.** An earlier version compared a bare
+  ref name against `ref<TAB>sha` lines, which can never match, so `--prune` deleted
+  every mirrored branch; it also treated a failed listing as an empty one. Both are
+  guarded now: a failed or empty upstream map aborts the prune for that repo.
+* **Read-only commands** (`status`, `verify`, `plan`) run 12 repositories at once; the
+  write path stays at 4, because `POST`/`PATCH`/`DELETE` count against GitHub's
+  per-minute write points, which `X-RateLimit-Remaining` does not expose.
+* Temporary API responses live in `.craftgang/run/<pid>/` and are deleted on exit, so a
+  manual `status` can no longer wipe the in-flight files of a scheduled `sync` (that
+  previously turned a live listing into an empty one). Directories older than 3 h are
+  swept by the next run.
 * Tags are copied by ref and annotated tag objects are preserved.
 * Concurrent runs are refused (`.craftgang/lock`); rate limits are honoured with
   backoff on `Retry-After` / `x-ratelimit-reset`.
@@ -84,7 +111,11 @@ Token lookup order: `CRAFTGANG_TOKEN` → `GH_TOKEN`/`GITHUB_TOKEN` →
 | --- | --- | --- |
 | `CRAFTGANG_SOURCE` | `storytold` | upstream org |
 | `CRAFTGANG_TARGET` | `CraftGang` | destination org (a user login also works) |
-| `CRAFTGANG_PARALLEL` | `4` | repositories processed at once |
+| `CRAFTGANG_READ_PARALLEL` | `12` | repositories processed at once by `status`/`verify`/`plan` |
+| `CRAFTGANG_WRITE_PARALLEL` | `4` | repositories processed at once by `sync`/`mirror` |
+| `CRAFTGANG_PARALLEL` | - | overrides both of the above, for every command |
+| `CRAFTGANG_CONNECT_TIMEOUT` | `10` | curl connect timeout, seconds |
+| `CRAFTGANG_MAX_TIME` | `60` | curl total timeout, seconds |
 | `CRAFTGANG_FORK_SPACING` | `20` | seconds between fork creations |
 | `CRAFTGANG_FORK_TIMEOUT` | `900` | seconds to wait for a fork to appear |
 | `CRAFTGANG_RATELIMIT_WAIT` | `300` | max backoff on rate limits |

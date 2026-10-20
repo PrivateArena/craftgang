@@ -23,15 +23,17 @@ SSH_KEY=${CRAFTGANG_SSH_KEY:-$HOME/.ssh/id_ed25519_GunGunGun}
 STATE_DIR=${CRAFTGANG_STATE:-$SCRIPT_DIR/.craftgang}
 SEP=$'\037'                              # field separator for repo rows (tab would collapse empties)
 LOG_FILE=$STATE_DIR/craftgang.log
-PARALLEL=${CRAFTGANG_PARALLEL:-4}
+PARALLEL=${CRAFTGANG_PARALLEL:-}               # empty -> picked per command below (see CMD_ARG)
+READ_PARALLEL=${CRAFTGANG_READ_PARALLEL:-12}   # concurrency for GET-only commands
+WRITE_PARALLEL=${CRAFTGANG_WRITE_PARALLEL:-4}  # concurrency for sync/mirror (write points = secondary limit)
 FORK_TIMEOUT=${CRAFTGANG_FORK_TIMEOUT:-900}    # seconds a fork may take to appear
 FORK_SPACING=${CRAFTGANG_FORK_SPACING:-20}     # seconds between fork creations (API limit)
 RL_MAX_SLEEP=${CRAFTGANG_RATELIMIT_WAIT:-300}   # cap for rate limit backoff
+CURL_CONNECT_TIMEOUT=${CRAFTGANG_CONNECT_TIMEOUT:-10}
+CURL_MAX_TIME=${CRAFTGANG_MAX_TIME:-60}
 
 CMD=sync DRY=0 FORCE=0 PRUNE=0 TAGS=1 SKIP_ARCH=0 JSON_OUT=0 QUIET=0 ALLOW_DISK=0 KEEP_MIRRORS=1
 declare -a ONLY=() EXCL=()
-mkdir -p "$STATE_DIR/mirrors"
-rm -f "$STATE_DIR"/body.* "$STATE_DIR"/headers.* "$STATE_DIR"/tags.* "$STATE_DIR"/upstream.*
 API_STATUS=0
 
 # ---------------------------------- output --------------------------------
@@ -65,7 +67,7 @@ ${bold}Commands${off}
 ${bold}Options${off}
   -r, --repo NAME        only this repo (repeatable)
   -x, --exclude NAME     skip this repo (repeatable)
-  -j, --parallel N       concurrent API jobs (default $PARALLEL)
+  -j, --parallel N       concurrent API jobs (default: $READ_PARALLEL for status/verify/plan, $WRITE_PARALLEL for sync/mirror)
   -f, --force            hard-reset branch refs to upstream SHA instead of merging
       --prune            delete refs in $TARGET_ORG that upstream removed
       --no-tags          do not mirror tags
@@ -106,27 +108,46 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 CMD_ARG=${CMD_ARG:-}
+# read-only commands issue nothing but GETs, so they can fan out wider without
+# touching the write-side secondary limits that keep sync at WRITE_PARALLEL
+if [[ -z ${PARALLEL:-} ]]; then
+  case $CMD in status|verify|plan) PARALLEL=$READ_PARALLEL ;; *) PARALLEL=$WRITE_PARALLEL ;; esac
+fi
+
+# One temp directory per invocation. The old global `rm -f $STATE_DIR/body.*` at
+# startup let a manual `status` delete a running cron `sync`'s in-flight API
+# responses, which then looked like empty ref listings (and pruned real refs).
+RUN_DIR=$STATE_DIR/run/$$
+TARGET_INDEX=$RUN_DIR/target.tsv SOURCE_INDEX=$RUN_DIR/source.tsv
+HAVE_INDEX=0 HAVE_SNAPSHOT=0
+mkdir -p "$STATE_DIR/mirrors" "$RUN_DIR"
+trap 'rm -rf "${RUN_DIR:?}"' EXIT
+find "$STATE_DIR/run" -mindepth 1 -maxdepth 1 -type d -mmin +180 -exec rm -rf {} + 2>/dev/null || :
 
 # ------------------------------------ HTTP --------------------------------
 J() { [[ -n ${RESP:-} && -f $RESP ]] || return 1; jq -r "$1" "$RESP" 2>/dev/null; }
 
 api_raw() { # api_raw METHOD PATH [JSON] -> API_STATUS, body path in $RESP
   local method=$1 path=$2 data=${3:-} code args attempt wait
-  local BODY_FILE=$STATE_DIR/body.$BASHPID HDR_FILE=$STATE_DIR/headers.$BASHPID
+  local BODY_FILE=$RUN_DIR/body.$BASHPID HDR_FILE=$RUN_DIR/headers.$BASHPID
   RESP=$BODY_FILE HDRC=$HDR_FILE          # inherited by $() children, unique per process
   for attempt in 1 2 3 4; do
     args=(-sS -o "$BODY_FILE" -D "$HDR_FILE" -w '%{http_code}' -X "$method"
+          --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME"
           -H "Authorization: Bearer $TOKEN"
           -H "Accept: application/vnd.github+json"
           -H "X-GitHub-Api-Version: 2022-11-28")
     [[ -n $data ]] && args+=(-H "Content-Type: application/json" --data "$data")
-    code=$(curl "${args[@]}" "$API$path" 2>>"$LOG_FILE") || { sleep $((attempt * 3)); continue; }
+    code=$(curl "${args[@]}" "$API$path" 2>>"$LOG_FILE") || {
+      # transport failure: back off, but never on the last attempt (that 12 s bought nothing)
+      (( attempt < 4 )) && sleep $((attempt * 3)); continue; }
     API_STATUS=$code
     # only genuine rate limits are retried here - other 4xx are real answers
     if [[ $code == 429 || $code == 403 ]] && grep -qi 'rate limit\|abuse detection' "$BODY_FILE" 2>/dev/null; then
       wait=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2}' "$HDR_FILE")
       [[ -z $wait ]] && wait=$(awk -v now="$(date +%s)" 'tolower($1)=="x-ratelimit-reset:"{gsub(/\r/,"",$2); d=$2-now; print (d>0?d:1)}' "$HDR_FILE")
       : "${wait:=60}"; (( wait > RL_MAX_SLEEP )) && wait=$RL_MAX_SLEEP
+      (( attempt < 4 )) || break          # do not sleep 300 s just to return a failure
       warn "rate limited on $method $path - sleeping ${wait}s"
       sleep "$wait"; continue
     fi
@@ -211,12 +232,77 @@ target_rows() {
 
 # ---------------------------- repo side operations ------------------------
 target_state() { # NAME -> none | fork:<parent> | plain | http<code>
+  local row parent
+  if [[ ${HAVE_INDEX:-0} == 1 ]]; then          # answered from the index, no per-repo GET
+    row=$(awk -F'\t' -v n="$1" '$1 == n { print $2 "\t" $3; exit }' "$TARGET_INDEX")
+    if [[ -n $row ]]; then
+      if [[ ${row%%$'\t'*} == true ]]; then
+        parent=${row#*$'\t'}; echo "fork:$parent"
+      else echo plain; fi
+      return 0
+    fi
+    # Absent from the listing. A listing can lag or omit a repo the token can still
+    # reach, and answering "none" here would let sync fork over it - confirm with one GET.
+  fi
   api_raw GET "/repos/$TARGET_ORG/$1"
   case $API_STATUS in
     404) echo none ;;
     200) [[ $(J .fork) == true ]] && echo "fork:$(J .parent.full_name)" || echo plain ;;
     *)   echo "http$API_STATUS" ;;
   esac
+}
+
+# One GraphQL page lists 100 repos with their fork parent and default branch head.
+# REST cannot do this: /orgs/{org}/repos does not return the `parent` field at all (only
+# the single-repo GET does) and never carries head SHAs, which is what forced one or two
+# API calls per repository before. Both sides of every comparison come from the same
+# source, so no REST/GraphQL SHA semantics are ever mixed.
+REPO_INDEX_QUERY='query($owner:String!,$cursor:String){repositoryOwner(login:$owner){repositories(first:100,after:$cursor,ownerAffiliations:[OWNER,COLLABORATOR,ORGANIZATION_MEMBER]){pageInfo{hasNextPage endCursor}nodes{name isFork parent{__typename ... on Repository{nameWithOwner}}defaultBranchRef{name target{oid}}}}}}'
+
+build_repo_index() { # ORG FILE -> name<TAB>isFork<TAB>parent<TAB>defBranch<TAB>defOid, ~1 call / 100 repos
+  local owner=$1 file=$2 cursor=''
+  : >"$file"
+  while :; do
+    api_raw POST "/graphql" "$(jq -nc --arg q "$REPO_INDEX_QUERY" --arg o "$owner" --arg c "$cursor" \
+               '{query:$q,variables:{owner:$o,cursor:(if $c == "" then null else $c end)}}')" || break
+    [[ $API_STATUS == 200 ]] || { warn "$owner index: HTTP $API_STATUS $(J .message)"; break; }
+    (( $(jq -r 'if .errors then (.errors | length) else 0 end' "$RESP") )) && { warn "$owner index: $(J .errors[0].message)"; break; }
+    [[ $(jq -r '.data.repositoryOwner == null' "$RESP") == true ]] && { warn "$owner is not visible to this token"; break; }
+    jq -r '.data.repositoryOwner.repositories.nodes[]
+      | [.name,(.isFork|tostring),(.parent.nameWithOwner // "-"),
+         (.defaultBranchRef.name // "-"),(.defaultBranchRef.target.oid // "-")] | @tsv' "$RESP" >>"$file"
+    [[ $(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' "$RESP") == true ]] || break
+    cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor // ""' "$RESP")
+    [[ -n $cursor ]] || break
+  done
+  [[ -s $file ]]
+}
+
+build_target_index() { # index $TARGET_ORG so state lookups need no per-repo GET
+  if build_repo_index "$TARGET_ORG" "$TARGET_INDEX"; then
+    HAVE_INDEX=1
+  else
+    rm -f "$TARGET_INDEX"                       # never let a half written index answer lookups
+    warn "indexing $TARGET_ORG failed - per-repo lookups"
+  fi
+  return 0
+}
+
+build_snapshot() { # index both sides -> default branch heads compare without any per-repo call
+  if build_repo_index "$SOURCE_ORG" "$SOURCE_INDEX" && build_repo_index "$TARGET_ORG" "$TARGET_INDEX"; then
+    HAVE_INDEX=1 HAVE_SNAPSHOT=1
+  else
+    rm -f "$TARGET_INDEX" "$SOURCE_INDEX"
+    warn "no default-branch snapshot for $SOURCE_ORG - comparing repositories one by one"
+  fi
+  return 0
+}
+
+index_head() { # FILE NAME BRANCH -> head sha of BRANCH, rc 1 when the index cannot answer exactly
+  local row
+  row=$(awk -F'\t' -v n="$2" -v b="$3" '$1 == n && $4 == b { print $5; exit }' "$1")
+  [[ -n $row && $row != - ]] || return 1
+  printf '%s\n' "$row"
 }
 
 create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
@@ -238,10 +324,16 @@ create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
       emit "  ${red}refused${off}    $name - $(J .message)"; return 2 ;;
     *) emit "  ${red}failed${off}     $name - HTTP $API_STATUS $(J .message)"; return 2 ;;
   esac
+  local poll
   while (( waited < FORK_TIMEOUT )); do
-    sleep 3; waited=$((waited + 3))
+    poll=3; (( waited < 15 )) && poll=1          # most forks are ready in a couple of seconds
+    sleep "$poll"; waited=$((waited + poll))
     api_raw GET "/repos/$TARGET_ORG/$name"
-    [[ $API_STATUS == 200 ]] && { emit "  ${grn}created${off}    $name ${dim}${waited}s${off}"; return 0; }
+    [[ $API_STATUS == 200 ]] || continue
+    # visible is not the same as populated: refs must actually have been copied across,
+    # otherwise the branch/tag sync below runs against an empty fork
+    api_raw GET "/repos/$TARGET_ORG/$name/branches?per_page=1"
+    [[ $API_STATUS == 200 && $(jq 'length' "$RESP") != 0 ]] && { emit "  ${grn}created${off}    $name ${dim}${waited}s${off}"; return 0; }
   done
   warn "fork $name not visible after ${FORK_TIMEOUT}s"
   note_deferred "$name"
@@ -251,11 +343,19 @@ create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
 # GitHub throttles fork creation (secondary rate limit), so creations are
 # serialised across the parallel workers and spaced out.
 fork_throttle() {
-  local now wait last
   if command -v flock >/dev/null 2>&1; then
-    exec 8>"$STATE_DIR/fork.lock"
-    flock 8 || return 0
+    # The wait must happen in a subshell: with `exec 8>` in the calling shell the lock was
+    # held until that sync_one job finished, i.e. through the readiness poll and the whole
+    # branch/tag sync, so spacing became max(20 s, entire repo sync) instead of 20 s.
+    ( flock 8 || exit 0; fork_gap ) 8>"$STATE_DIR/fork.lock"
+  else
+    fork_gap
   fi
+  return 0
+}
+
+fork_gap() { # honour FORK_SPACING, then record this creation time
+  local last now wait
   last=$(cat "$STATE_DIR/lastfork" 2>/dev/null || echo 0)
   now=$(date +%s); wait=$(( last + FORK_SPACING - now ))
   (( wait > 0 )) && sleep "$wait"
@@ -268,26 +368,30 @@ note_deferred() { # remember repos that still need work, for the closing summary
   [[ -f $f ]] && grep -qxF "$1" "$f" || echo "$1" >>"$f"
 }
 
-upstream_branches() { # NAME -> every branch name (paginated, >100 branches safe)
-  local name=$1 page=1 n
-  while :; do
-    api_raw GET "/repos/$SOURCE_ORG/$name/branches?per_page=100&page=$page" || return 1
-    [[ $API_STATUS == 200 ]] || return 1
-    n=$(jq 'length' "$RESP")
-    [[ ${n:-0} == 0 ]] && break
-    J '.[].name'
-    [[ $n -lt 100 ]] && break
-    page=$((page + 1))
-  done
+count_branches() { # ORG NAME -> branch count in ONE call (per_page=1 + Link rel="last")
+  local org=$1 name=$2 last
+  api_raw GET "/repos/$org/$name/branches?per_page=1" || return 1
+  case $API_STATUS in
+    404) echo 0; return 0 ;;                 # repo not there yet - counted as zero, not as an error
+    200) : ;;
+    *) return 1 ;;
+  esac
+  # at per_page=1 the last page number *is* the item count, so a 370 branch repo
+  # (vectorcraft) costs the same single tiny call as a 1 branch repo
+  last=$(tr -d '\r' <"$HDRC" | sed -n 's/.*[?&]page=\([0-9]*\)>; rel="last".*/\1/p' | head -1)
+  [[ -n $last ]] && { echo "$last"; return 0; }
+  jq 'length' "$RESP"
   return 0
 }
 # NOTE: /git/refs/* ignores ?page= (it keeps returning the first page), so the
 # paginated /branches and /tags listings are used for all bulk ref comparisons.
 ref_map() { # ref_map ORG NAME -> "refs/heads/<name><TAB>sha" for every branch
+  # A failed listing returns 1: an empty map from a 403 would otherwise be read as
+  # "upstream has no branches", which means "create every ref" or "prune every ref".
   local org=$1 name=$2 page=1 n
   while :; do
-    api_raw GET "/repos/$org/$name/branches?per_page=100&page=$page"
-    [[ $API_STATUS == 200 ]] || break
+    api_raw GET "/repos/$org/$name/branches?per_page=100&page=$page" || return 1
+    [[ $API_STATUS == 200 ]] || { warn "$org/$name branches: HTTP $API_STATUS $(J .message)"; return 1; }
     n=$(jq 'length' "$RESP")
     [[ ${n:-0} == 0 ]] && break
     jq -r --arg p "refs/heads/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
@@ -300,8 +404,8 @@ ref_map() { # ref_map ORG NAME -> "refs/heads/<name><TAB>sha" for every branch
 tag_map() { # tag_map ORG NAME -> "refs/tags/<name><TAB>commit sha"
   local org=$1 name=$2 page=1 n
   while :; do
-    api_raw GET "/repos/$org/$name/tags?per_page=100&page=$page"
-    [[ $API_STATUS == 200 ]] || break
+    api_raw GET "/repos/$org/$name/tags?per_page=100&page=$page" || return 1
+    [[ $API_STATUS == 200 ]] || { warn "$org/$name tags: HTTP $API_STATUS $(J .message)"; return 1; }
     n=$(jq 'length' "$RESP")
     [[ ${n:-0} == 0 ]] && break
     jq -r --arg p "refs/tags/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
@@ -315,8 +419,17 @@ sha_of() { # sha_of MAPFILE REFNAME -> sha
   awk -F'\t' -v r="$2" '$1 == r { print $2; exit }' "$1"
 }
 
-target_sha() { api_raw GET "/repos/$TARGET_ORG/$1/git/ref/heads/$(enc "$2")"; [[ $API_STATUS == 200 ]] && J '.object.sha'; }
-upstream_sha() { api_raw GET "/repos/$SOURCE_ORG/$1/git/ref/heads/$(enc "$2")"; [[ $API_STATUS == 200 ]] && J '.object.sha'; }
+head_sha() { # ORG NAME BRANCH -> head sha of a single branch (1 tiny call, rc 3 = branch absent)
+  api_raw GET "/repos/$1/$2/git/ref/heads/$(enc "$3")" || return 1
+  case $API_STATUS in
+    200) J '.object.sha' ;;
+    404) return 3 ;;
+    *)   return 1 ;;
+  esac
+}
+
+target_sha() { head_sha "$TARGET_ORG" "$1" "$2"; }
+upstream_sha() { head_sha "$SOURCE_ORG" "$1" "$2"; }
 enc() { jq -rn --arg s "$1" '$s|@uri'; }
 
 create_ref() { # NAME REF SHA -> branch exists upstream but not in the mirror yet
@@ -342,9 +455,11 @@ merge_upstream() { # NAME BRANCH -> "synced|upto-date|conflict:<msg>"
 
 sync_branches() { # NAME -> branch<TAB>action<TAB>note   (2 bulk calls when nothing changed)
   local name=$1 ref sha tsha act branch
-  local up=$STATE_DIR/up.$name.tmp tp=$STATE_DIR/dst.$name.tmp
-  ref_map "$SOURCE_ORG" "$name" >"$up"
-  ref_map "$TARGET_ORG" "$name" >"$tp"
+  local up=$RUN_DIR/up.$name.tmp tp=$RUN_DIR/dst.$name.tmp
+  ref_map "$SOURCE_ORG" "$name" >"$up" || {
+    printf '%s\t%s\t%s\n' '-' list-failed "upstream branches: HTTP $API_STATUS"; return 1; }
+  ref_map "$TARGET_ORG" "$name" >"$tp" || {
+    printf '%s\t%s\t%s\n' '-' list-failed "mirror branches: HTTP $API_STATUS"; return 1; }
   while IFS=$'\t' read -r ref sha; do
     [[ -z ${ref:-} ]] && continue
     branch=${ref#refs/heads/}
@@ -367,7 +482,7 @@ sync_branches() { # NAME -> branch<TAB>action<TAB>note   (2 bulk calls when noth
     fi
     printf '%s\t%s\t%s\n' "$branch" "${act%%:*}" "${act#*:}"
   done <"$up"
-  rm -f "$up" "$tp"
+  [[ $PRUNE == 1 ]] || rm -f "$up" "$tp"   # --prune reuses these maps instead of re-fetching them
   return 0
 }
 
@@ -382,9 +497,15 @@ force_sha() { # NAME REF UP_SHA CUR_SHA -> hard reset (or create) the mirror ref
 
 sync_tags() { # NAME -> tag<TAB>action<TAB>sha  (bulk compare, then add/update what differs)
   local name=$1 ref sha tsha page=1
-  local up=$STATE_DIR/tup.$name.tmp tp=$STATE_DIR/tdst.$name.tmp
-  tag_map "$TARGET_ORG" "$name" >"$tp"
-  tag_map "$SOURCE_ORG" "$name" >"$up"
+  local up=$RUN_DIR/tup.$name.tmp tp=$RUN_DIR/tdst.$name.tmp
+  tag_map "$SOURCE_ORG" "$name" >"$up" || {
+    printf '%s\t%s\t%s\n' '-' tag-list-failed "upstream tags: HTTP $API_STATUS"; return 1; }
+  if [[ -s $up ]]; then                     # only look at the mirror when there is something to copy
+    tag_map "$TARGET_ORG" "$name" >"$tp" || {
+      printf '%s\t%s\t%s\n' '-' tag-list-failed "mirror tags: HTTP $API_STATUS"; return 1; }
+  else
+    : >"$tp"
+  fi
   while IFS=$'\t' read -r ref sha; do
     [[ -z ${ref:-} ]] && continue
     tsha=$(sha_of "$tp" "$ref")
@@ -404,29 +525,48 @@ sync_tags() { # NAME -> tag<TAB>action<TAB>sha  (bulk compare, then add/update w
       *)       printf '%s\ttag-failed\t%s\n' "${ref#refs/tags/}" "$(J .message)" ;;
     esac
   done <"$up"
-  rm -f "$up" "$tp"
+  [[ $PRUNE == 1 ]] || rm -f "$up" "$tp"
   return 0
 }
 
 prune_refs() { # NAME heads|tags -> delete mirror refs upstream no longer has
-  local name=$1 kind=$2 ref up=$STATE_DIR/pup.$name.tmp tp=$STATE_DIR/pdst.$name.tmp
+  local name=$1 kind=$2 up tp fetched=0 ref doomed
   if [[ $kind == heads ]]; then
-    ref_map "$SOURCE_ORG" "$name"    >"$up"
-    ref_map "$TARGET_ORG" "$name"   >"$tp"
+    up=$RUN_DIR/up.$name.tmp; tp=$RUN_DIR/dst.$name.tmp
   else
-    tag_map "$SOURCE_ORG" "$name"    >"$up"
-    tag_map "$TARGET_ORG" "$name"   >"$tp"
+    up=$RUN_DIR/tup.$name.tmp; tp=$RUN_DIR/tdst.$name.tmp
   fi
-  local refs
-  refs=$(cut -f1 "$tp")
-  while read -r ref; do
+  if [[ -s $up && -f $tp ]]; then           # reuse the bulk maps sync_branches / sync_tags just made
+    fetched=0
+  else
+    fetched=1
+    if [[ $kind == heads ]]; then
+      ref_map "$SOURCE_ORG" "$name" >"$up" && ref_map "$TARGET_ORG" "$name" >"$tp" || fetched=0
+    else
+      tag_map "$SOURCE_ORG" "$name" >"$up" && tag_map "$TARGET_ORG" "$name" >"$tp" || fetched=0
+    fi
+    # NEVER prune against a failed listing: an unreadable upstream map used to mean
+    # "delete every ref in the mirror"
+    if (( ! fetched )); then
+      warn "$name: upstream $kind listing failed - prune skipped"
+      return 1
+    fi
+  fi
+  doomed=$RUN_DIR/prune.$name.$kind.tmp
+  if [[ -s $up ]]; then
+    # ref, not the whole "ref<TAB>sha" line - matching the line made -x never fire
+    awk -F'\t' 'NR == FNR { keep[$1]; next } !($1 in keep) { print $1 }' "$up" "$tp" >"$doomed"
+  else
+    cut -f1 "$tp" >"$doomed"                # upstream has no $kind at all -> every mirror ref is extra
+  fi
+  while IFS= read -r ref; do
     [[ -z $ref ]] && continue
-    grep -qxF "$ref" "$up" && continue
     if [[ $DRY == 1 ]]; then emit "  ${ylw}prune${off}      $name:${ref#refs/} ${dim}(would delete)${off}"; continue; fi
     api_raw DELETE "/repos/$TARGET_ORG/$name/git/refs/${ref#refs/}"
     [[ $API_STATUS == 204 ]] && emit "  ${ylw}pruned${off}     $name:${ref#refs/}"
-  done <<<"$refs"
-  rm -f "$up" "$tp"
+  done <"$doomed"
+  rm -f "$doomed"
+  (( fetched )) && rm -f "$up" "$tp"
   return 0
 }
 
@@ -500,6 +640,7 @@ single_run_guard() { # refuse two concurrent runs (they would fight over refs)
 cmd_sync() {
   load_token
   single_run_guard
+  build_target_index
   local rows total
   rows=$(target_rows) || die "cannot list $SOURCE_ORG"
   total=$(grep -c . <<<"$rows")
@@ -515,51 +656,72 @@ cmd_sync() {
   say "finished ${dim}$(date -u '+%F %T UTC') - log: $LOG_FILE${off}"
 }
 
-cmd_status() {
-  load_token
-  local name rest archived isfork parent def priv size st na nb state note first=1
-  if [[ $JSON_OUT == 1 ]]; then printf '['; fi
-  [[ $JSON_OUT == 1 ]] || printf '%-44s %-8s %-9s %s\n' "${bold}REPO${off}" "${bold}STATE${off}" "${bold}BRANCHES${off}" "${bold}NOTE${off}"
-  while IFS=$SEP read -r name archived isfork parent def priv size; do
-    [[ -z ${name:-} ]] && continue
-    st=$(target_state "$name")
-    nb=$(upstream_branches "$name" | grep -c .)
-    na=$(target_branch_count "$name")
-    state=${st%%:*}
-    if [[ $state == fork ]]; then
-      [[ $st == fork:"$SOURCE_ORG/$name" ]] && note=upstream\=$SOURCE_ORG || note="${red}wrong parent${off}"
-    else
-      note=${st#fork:}
-    fi
-    if [[ $JSON_OUT == 1 ]]; then
-      [[ $first == 1 ]] && first=0 || printf ','
-      jq -nc --arg n "$name" --arg s "$state" --arg p "$parent" --arg a "$archived" --argjson nb "${nb:-0}" --argjson na "$na" \
-        '{repo:$n,state:$s,upstream:$p,archived:($a=="true"),up_branches:$nb,mirrored_branches:$na}'
-    else
-      printf '%-44s %-8s %-9s %s\n' "$name" "$state" "$na/$nb" "$note"
-    fi
-  done < <(target_rows)
-  [[ $JSON_OUT == 1 ]] && printf ']'
+status_one() { # one row -> "state<TAB>na<TAB>nb<TAB>note" in $RUN_DIR/status.<name> (ordered by cmd_status)
+  local name archived isfork parent def priv size st na nb state note rc=0
+  IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
+  st=$(target_state "$name")
+  nb=$(count_branches "$SOURCE_ORG" "$name") || { nb='?'; rc=1; }
+  na=$(count_branches "$TARGET_ORG" "$name") || { na='?'; rc=1; }
+  state=${st%%:*}
+  case $state in
+    fork)  if [[ $st == fork:"$SOURCE_ORG/$name" ]]; then note="upstream=$SOURCE_ORG"
+           elif [[ $st == fork:- ]]; then state=fork; note="parent not visible"
+           else note="wrong parent ${st#fork:}"; fi ;;
+    plain) note="plain repo - refs pushed server side" ;;
+    none)  note="not mirrored yet" ;;
+    error) state=error; note="${st#error}" ;;
+    *)     state=error; note="$st" ;;
+  esac
+  # a failed count is never silently printed as 0 - that would look like "nothing to mirror"
+  if (( rc )) && [[ $state != error ]]; then state=error; note="branch count failed (HTTP $API_STATUS)"; fi
+  printf '%s\t%s\t%s\t%s\n' "$state" "$na" "$nb" "$note" >"$RUN_DIR/status.$name"
   return 0
 }
 
-target_branch_count() { # NAME -> number of branches in the mirror (paginated)
-  local name=$1 page=1 n total=0
-  while :; do
-    api_raw GET "/repos/$TARGET_ORG/$name/branches?per_page=100&page=$page"
-    [[ $API_STATUS == 200 ]] || break
-    n=$(jq 'length' "$RESP")
-    [[ ${n:-0} == 0 ]] && break
-    total=$((total + n))
-    [[ $n -lt 100 ]] && break
-    page=$((page + 1))
-  done
-  echo "$total"
+cmd_status() {
+  load_token
+  build_target_index
+  local rows name rest archived isfork parent def priv size state counts note nb na first=1 f
+  rows=$(target_rows) || die "cannot list $SOURCE_ORG"
+  printf '%s\n' "$rows" | run_pool status_one      # was a serial loop: same calls as verify, 4x slower
+  if [[ $JSON_OUT == 1 ]]; then printf '['
+  else printf '%-44s %-8s %-9s %s\n' "${bold}REPO${off}" "${bold}STATE${off}" "${bold}BRANCHES${off}" "${bold}NOTE${off}"; fi
+  while IFS=$SEP read -r name archived isfork parent def priv size; do    # printed in listing order
+    [[ -z ${name:-} ]] && continue
+    f=$RUN_DIR/status.$name
+    if [[ -f $f ]]; then
+      IFS=$'\t' read -r state na nb note <"$f"
+    else
+      state=error na='?' nb='?' note="worker produced no result"
+    fi
+    if [[ $JSON_OUT == 1 ]]; then
+      [[ $first == 1 ]] && first=0 || printf ','
+      [[ $nb =~ ^[0-9]+$ ]] || nb=0
+      [[ $na =~ ^[0-9]+$ ]] || na=0
+      jq -nc --arg n "$name" --arg s "$state" --arg p "$parent" --arg a "$archived" \
+        --argjson nb "$nb" --argjson na "$na" \
+        '{repo:$n,state:$s,upstream:$p,archived:($a=="true"),up_branches:$nb,mirrored_branches:$na}'
+    else
+      case $note in
+        upstream=*) ;;                                       # the normal, healthy line
+        "wrong parent"*) note="${red}$note${off}" ;;
+        *) note="${dim}$note${off}" ;;
+      esac
+      printf '%-44s %-8s %-9s %s\n' "$name" "$state" "$na/$nb" "$note"
+    fi
+  done <<<"$rows"
+  [[ $JSON_OUT == 1 ]] && printf ']'
+  return 0
 }
 
 cmd_verify() {
   load_token
   single_run_guard
+  if [[ -z ${ALL:-} ]]; then
+    build_snapshot                              # default branches: 2 GraphQL calls replace 132 REST calls
+  else
+    build_target_index
+  fi
   local rows; rows=$(target_rows)
   : >"$STATE_DIR/drift.tsv"
   say "${bold}$SOURCE_ORG${off} vs ${bold}$TARGET_ORG${off} - comparing ${ALL:-default branches}${ALL:+ of every branch}   ${dim}drift list: $STATE_DIR/drift.tsv${off}"
@@ -569,7 +731,7 @@ cmd_verify() {
   say "${grn}in sync${off} - every compared branch is byte-identical by commit SHA"
 }
 
-verify_one() { # one row -> compares branch head SHAs, 2 bulk API calls per repo
+verify_one() { # one row -> compares branch head SHAs (2 calls per repo, 4 with -a)
   local name archived isfork parent def priv size st n=0 bad=0 ref sha tsha up tp
   IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
   up=$STATE_DIR/vup.$name.tmp; tp=$STATE_DIR/vdst.$name.tmp
@@ -581,12 +743,50 @@ verify_one() { # one row -> compares branch head SHAs, 2 bulk API calls per repo
     printf '%s\t%s\t%s\n' "$name" "-" "missing" >>"$STATE_DIR/drift.tsv"
     emit "  ${red}missing${off}    $name"; flush; return 1
   fi
-  ref_map "$SOURCE_ORG" "$name" >"$up"
-  ref_map "$TARGET_ORG" "$name" >"$tp"
-  if [[ -z ${ALL:-} && -n $def ]]; then          # only the default branch unless -a
-    grep -F "refs/heads/$def	" "$up" >"$up.2" || : >"$up.2"
-    mv "$up.2" "$up"
+  # default-branch mode (no -a): one head per side, nothing paginated, so a 370 branch
+  # repo costs exactly the same as a 1 branch repo.
+  if [[ -z ${ALL:-} && -n ${def:-} ]]; then
+    local rc=0
+    if [[ ${HAVE_SNAPSHOT:-0} == 1 ]] && sha=$(index_head "$SOURCE_INDEX" "$name" "$def"); then
+      tsha=$(index_head "$TARGET_INDEX" "$name" "$def") || tsha=''    # no row = no branch on the mirror
+    else
+      # snapshot cannot answer (or is unavailable): two single-ref REST reads for this repo
+      sha=$(head_sha "$SOURCE_ORG" "$name" "$def") || rc=$?
+      if (( rc )); then
+        if (( rc == 3 )) && [[ $archived == true || ${size:-0} == 0 ]]; then
+          emit "  ${dim}empty${off}      $name ${dim}(no commits upstream)${off}"; flush; return 0
+        fi
+        printf '%s\t%s\t%s\n' "$name" "$def" "unreadable" >>"$STATE_DIR/drift.tsv"   # counts as drift, never as "in sync"
+        emit "  ${red}error${off}      $name upstream $def unreadable (HTTP $API_STATUS)"; flush; return 1
+      fi
+      rc=0
+      tsha=$(head_sha "$TARGET_ORG" "$name" "$def") || rc=$?
+      if (( rc && rc != 3 )); then
+        printf '%s\t%s\t%s\n' "$name" "$def" "unreadable" >>"$STATE_DIR/drift.tsv"
+        emit "  ${red}error${off}      $name mirror $def unreadable (HTTP $API_STATUS)"; flush; return 1
+      fi
+      [[ $rc == 3 ]] && tsha=''                 # branch absent on the mirror
+    fi
+    n=1
+    if [[ -n $tsha && $tsha == "$sha" ]]; then
+      emit "  ${grn}ok${off}         $name ${dim}1 branch identical${off}"
+    else
+      bad=1
+      printf '%s\t%s\t%s\n' "$name" "$def" "${tsha:-missing}" >>"$STATE_DIR/drift.tsv"
+      emit "  ${red}drift${off}      $name $def ${dim}${tsha:-missing} != ${sha:0:7}${off}"
+      emit "  ${red}stale${off}      $name 1/1 branch differs - run: sync -r $name"
+    fi
+    flush
+    (( bad )) && return 1
+    return 0
   fi
+  # -a: compare every branch, which needs the full listings
+  ref_map "$SOURCE_ORG" "$name" >"$up" || {
+    printf '%s\t%s\t%s\n' "$name" "*" "source-listing-failed" >>"$STATE_DIR/drift.tsv"
+    emit "  ${red}error${off}      $name upstream branch listing failed"; flush; return 1; }
+  ref_map "$TARGET_ORG" "$name" >"$tp" || {
+    printf '%s\t%s\t%s\n' "$name" "*" "target-listing-failed" >>"$STATE_DIR/drift.tsv"
+    emit "  ${red}error${off}      $name mirror branch listing failed"; flush; return 1; }
   while IFS=$'\t' read -r ref sha; do
     [[ -z ${ref:-} ]] && continue
     n=$((n + 1))
