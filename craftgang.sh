@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+# craftgang.sh - mirror every repository of an upstream GitHub org into CraftGang.
+#
+# Default mode is DISKLESS: only GitHub REST calls (create a fork, then the
+# server-side "Sync fork" / force ref update). No repository bytes are ever
+# downloaded to this machine - the same thing as clicking Fork on github.com.
+#
+#   ./craftgang.sh auth                 # who is the token, may it write to CraftGang
+#   ./craftgang.sh plan                 # read-only report of what is missing / stale
+#   ./craftgang.sh sync                 # fork missing repos, sync branches + tags
+#   ./craftgang.sh sync -r artcraft     # one repo only
+#   ./craftgang.sh verify               # exit non-zero on drift (cron friendly)
+#   ./craftgang.sh schedule 6h          # keep it fresh automatically
+set -uo pipefail
+
+# ------------------------------- configuration ----------------------------
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_ORG=${CRAFTGANG_SOURCE:-storytold}      # upstream, mirrored from
+TARGET_ORG=${CRAFTGANG_TARGET:-CraftGang}      # ours, mirrored into
+API=${CRAFTGANG_API:-https://api.github.com}
+GIT_HOST=${CRAFTGANG_GIT_HOST:-github.com}
+SSH_KEY=${CRAFTGANG_SSH_KEY:-$HOME/.ssh/id_ed25519_GunGunGun}
+STATE_DIR=${CRAFTGANG_STATE:-$SCRIPT_DIR/.craftgang}
+SEP=$'\037'                              # field separator for repo rows (tab would collapse empties)
+LOG_FILE=$STATE_DIR/craftgang.log
+PARALLEL=${CRAFTGANG_PARALLEL:-4}
+FORK_TIMEOUT=${CRAFTGANG_FORK_TIMEOUT:-900}    # seconds a fork may take to appear
+FORK_SPACING=${CRAFTGANG_FORK_SPACING:-20}     # seconds between fork creations (API limit)
+RL_MAX_SLEEP=${CRAFTGANG_RATELIMIT_WAIT:-300}   # cap for rate limit backoff
+
+CMD=sync DRY=0 FORCE=0 PRUNE=0 TAGS=1 SKIP_ARCH=0 JSON_OUT=0 QUIET=0 ALLOW_DISK=0 KEEP_MIRRORS=1
+declare -a ONLY=() EXCL=()
+mkdir -p "$STATE_DIR/mirrors"
+rm -f "$STATE_DIR"/body.* "$STATE_DIR"/headers.* "$STATE_DIR"/tags.* "$STATE_DIR"/upstream.*
+API_STATUS=0
+
+# ---------------------------------- output --------------------------------
+bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' grn=$'\e[32m' ylw=$'\e[33m' blu=$'\e[34m' off=$'\e[0m'
+[[ -t 1 ]] || { bold= dim= red= grn= ylw= blu= off=; }
+
+log()  { printf '%s %s\n' "$(date -u '+%F %T')" "$*" >>"$LOG_FILE"; }
+say()  { [[ $QUIET == 1 ]] || printf '%b\n' "$*"; }
+warn() { printf '%b\n' "${ylw}warn${off}  $*" >&2; }
+die()  { printf '%b\n' "${red}error${off} $*" >&2; exit 1; }
+
+usage() {
+  cat <<'TXT'
+craftgang.sh - keep CraftGang an exact mirror of an upstream GitHub org
+
+TXT
+  cat <<EOF
+${bold}Commands${off}
+  sync                fork missing repos, then sync every branch and tag   (default)
+  plan                same as sync, changes nothing
+  status              per-repo table: missing / fork / branch coverage
+  verify              compare branch SHAs with upstream, exit 1 on drift (default branch;
+                      -a compares every branch)     
+  mirror              disk fallback (git clone --mirror + push --mirror) for repos
+                      GitHub refuses to fork (archived, fork-count limits)
+  auth                show token identity, scopes and access to $TARGET_ORG
+  token [FILE|-]      save the PAT used for $TARGET_ORG ("show" to inspect)
+  schedule [INTERVAL] install/remove cron sync (6h default, "clear" removes)
+  clean               delete temporary on-disk bare mirrors
+
+${bold}Options${off}
+  -r, --repo NAME        only this repo (repeatable)
+  -x, --exclude NAME     skip this repo (repeatable)
+  -j, --parallel N       concurrent API jobs (default $PARALLEL)
+  -f, --force            hard-reset branch refs to upstream SHA instead of merging
+      --prune            delete refs in $TARGET_ORG that upstream removed
+      --no-tags          do not mirror tags
+      --skip-archived    leave archived upstream repos alone
+      --json             machine readable output (status)
+  -q, --quiet            log only
+      --keep-disk        allow "mirror" to run over every repo (needs disk)
+  -K, --no-keep          delete the cached bare mirror after pushing
+      --source ORG       upstream org        (default $SOURCE_ORG)
+      --target ORG       destination org/user (default $TARGET_ORG)
+  -h, --help             this text
+EOF
+}
+
+# --------------------------------- parsing --------------------------------
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    sync|plan|status|verify|mirror|auth|clean) CMD=$1 ;;
+    token|schedule)  CMD=$1; shift; CMD_ARG=${1:-}; continue ;;
+    -r|--repo)    ONLY+=("$2"); shift ;;
+    -x|--exclude) EXCL+=("$2"); shift ;;
+    -j|--parallel) PARALLEL=$2; shift ;;
+    -f|--force)   FORCE=1 ;;
+    --prune)      PRUNE=1 ;;
+    --no-tags)    TAGS=0 ;;
+    --skip-archived) SKIP_ARCH=1 ;;
+    --json)       JSON_OUT=1 ;;
+    -a|--all)     ALL=all ;;
+    -q|--quiet)   QUIET=1 ;;
+    --keep-disk)  ALLOW_DISK=1 ;;
+    -K|--no-keep) KEEP_MIRRORS=0 ;;
+    --source)     SOURCE_ORG=$2; shift ;;
+    --target)     TARGET_ORG=$2; shift ;;
+    -n|--dry-run) DRY=1; CMD=plan ;;
+    -h|--help)    usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+CMD_ARG=${CMD_ARG:-}
+
+# ------------------------------------ HTTP --------------------------------
+J() { [[ -n ${RESP:-} && -f $RESP ]] || return 1; jq -r "$1" "$RESP" 2>/dev/null; }
+
+api_raw() { # api_raw METHOD PATH [JSON] -> API_STATUS, body path in $RESP
+  local method=$1 path=$2 data=${3:-} code args attempt wait
+  local BODY_FILE=$STATE_DIR/body.$BASHPID HDR_FILE=$STATE_DIR/headers.$BASHPID
+  RESP=$BODY_FILE HDRC=$HDR_FILE          # inherited by $() children, unique per process
+  for attempt in 1 2 3 4; do
+    args=(-sS -o "$BODY_FILE" -D "$HDR_FILE" -w '%{http_code}' -X "$method"
+          -H "Authorization: Bearer $TOKEN"
+          -H "Accept: application/vnd.github+json"
+          -H "X-GitHub-Api-Version: 2022-11-28")
+    [[ -n $data ]] && args+=(-H "Content-Type: application/json" --data "$data")
+    code=$(curl "${args[@]}" "$API$path" 2>>"$LOG_FILE") || { sleep $((attempt * 3)); continue; }
+    API_STATUS=$code
+    # only genuine rate limits are retried here - other 4xx are real answers
+    if [[ $code == 429 || $code == 403 ]] && grep -qi 'rate limit\|abuse detection' "$BODY_FILE" 2>/dev/null; then
+      wait=$(awk 'tolower($1)=="retry-after:"{gsub(/\r/,"",$2); print $2}' "$HDR_FILE")
+      [[ -z $wait ]] && wait=$(awk -v now="$(date +%s)" 'tolower($1)=="x-ratelimit-reset:"{gsub(/\r/,"",$2); d=$2-now; print (d>0?d:1)}' "$HDR_FILE")
+      : "${wait:=60}"; (( wait > RL_MAX_SLEEP )) && wait=$RL_MAX_SLEEP
+      warn "rate limited on $method $path - sleeping ${wait}s"
+      sleep "$wait"; continue
+    fi
+    log "$code $method $path"
+    return 0
+  done
+  return 1
+}
+
+# ----------------------------------- auth ---------------------------------
+load_token() {
+  [[ -n ${TOKEN:-} ]] && return 0
+  TOKEN=${CRAFTGANG_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}
+  [[ -n $TOKEN ]] && { TOKEN_SRC=env; return 0; }
+  local f
+  for f in "$STATE_DIR/token" "$SCRIPT_DIR/craftgang.token" "$HOME/.config/craftgang/token"; do
+    [[ -s $f ]] && { TOKEN=$(tr -d ' \t\r\n' <"$f"); TOKEN_SRC=$f; return 0; }
+  done
+  command -v gh >/dev/null 2>&1 && TOKEN=$(gh auth token 2>/dev/null)
+  [[ -n $TOKEN ]] && { TOKEN_SRC="gh CLI"; return 0; }
+  die "no GitHub token available.
+  A token is needed because creating/forking repositories in $TARGET_ORG is a
+  server side API call. It must belong to an account that may create repos in
+  $TARGET_ORG (classic scopes: repo,read:org - fine-grained: Administration RW,
+  Contents RW, Pull requests RW). Then:
+      ./craftgang.sh token <pat-file>        # or: echo PAT | ./craftgang.sh token -"
+}
+
+cmd_auth() {
+  load_token
+  api_raw GET /user || die "cannot reach $API"
+  [[ $API_STATUS == 200 ]] || die "token from $TOKEN_SRC rejected (HTTP $API_STATUS): $(J .message)"
+  local me; me=$(J .login)
+  say "identity   : ${bold}$me${off}  ${dim}($TOKEN_SRC, $(J .type))${off}"
+  say "scopes     : $(grep -i '^x-oauth-scopes:' "$HDRC" | cut -d' ' -f2- | tr -d '\r')"
+  api_raw GET "/orgs/$TARGET_ORG/members/$me"
+  case $API_STATUS in
+    204) say "target     : ${grn}$TARGET_ORG - member${off}" ;;
+    404) say "target     : ${red}$TARGET_ORG - not a member, cannot fork/create there${off}" ;;
+    *)   say "target     : ${red}$TARGET_ORG - HTTP $API_STATUS${off}" ;;
+  esac
+  api_raw GET "/orgs/$TARGET_ORG"
+  [[ $API_STATUS == 200 ]] && say "           : $(J .login), $(J .public_repos) public repos visible"
+  api_raw GET "/orgs/$SOURCE_ORG"
+  [[ $API_STATUS == 200 ]] && say "source     : ${bold}$(J .login)${off} - $(J .public_repos) public repos"
+  say "write test : ${dim}POST /repos/$SOURCE_ORG/<repo>/forks{organization:$TARGET_ORG}${off}"
+}
+
+# -------------------------------- discovery -------------------------------
+source_repos() { # name<TAB>archived<TAB>fork<TAB>parent<TAB>default<TAB>private<TAB>size_kb
+  local page=1 n
+  while :; do
+    api_raw GET "/orgs/$SOURCE_ORG/repos?per_page=100&type=all&sort=full_name&page=$page" || return 1
+    [[ $API_STATUS == 200 ]] || { warn "list $SOURCE_ORG: HTTP $API_STATUS $(J .message)"; return 1; }
+    n=$(jq 'length' "$RESP")
+    [[ ${n:-0} == 0 ]] && break
+    jq -r --arg s "$SEP" '.[] | [.name,(.archived|tostring),(.fork|tostring),(.parent.full_name // ""),.default_branch,(.private|tostring),(.size|tostring)] | join($s)' "$RESP"
+    [[ $n -lt 100 ]] && break
+    page=$((page + 1))
+  done
+  return 0
+}
+
+selected() {
+  local name=$1 hit r e
+  if [[ ${#ONLY[@]} -gt 0 ]]; then
+    hit=0
+    for r in "${ONLY[@]}"; do [[ $r == "$name" ]] && hit=1; done
+    [[ $hit == 1 ]] || return 1
+  fi
+  for e in "${EXCL[@]:-}"; do [[ -n $e && $e == "$name" ]] && return 1; done
+  return 0
+}
+
+target_rows() {
+  local name rest
+  while IFS=$SEP read -r name rest; do
+    [[ -n ${name:-} ]] && selected "$name" && printf '%s%s%s\n' "$name" "$SEP" "$rest"
+  done < <(source_repos)
+  return 0
+}
+
+# ---------------------------- repo side operations ------------------------
+target_state() { # NAME -> none | fork:<parent> | plain | http<code>
+  api_raw GET "/repos/$TARGET_ORG/$1"
+  case $API_STATUS in
+    404) echo none ;;
+    200) [[ $(J .fork) == true ]] && echo "fork:$(J .parent.full_name)" || echo plain ;;
+    *)   echo "http$API_STATUS" ;;
+  esac
+}
+
+create_fork() { # NAME -> 0 ok, 2 refused, 3 deferred (rate limited)
+  local name=$1 payload waited=0
+  payload=$(jq -nc --arg o "$TARGET_ORG" --arg n "$name" '{organization:$o,name:$n,default_branch_only:false}')
+  if [[ $DRY == 1 ]]; then emit "  ${blu}fork${off}       $name ${dim}(would create)${off}"; return 0; fi
+  fork_throttle
+  api_raw POST "/repos/$SOURCE_ORG/$name/forks" "$payload"
+  case $API_STATUS in
+    201|202) ;;
+    422) emit "  ${red}refused${off}    $name - $(J .message)"; return 2 ;;
+    403|429)
+      if grep -qi 'empty repositor\|no git content' "$RESP" 2>/dev/null; then
+        emit "  ${dim}empty${off}      $name ${dim}(upstream has no commits - nothing to mirror)${off}"; return 4
+      fi
+      if grep -qi 'rate limit\|abuse' "$RESP" 2>/dev/null; then
+        note_deferred "$name"; emit "  ${ylw}deferred${off}   $name ${dim}fork throttled - next run will retry${off}"; return 3
+      fi
+      emit "  ${red}refused${off}    $name - $(J .message)"; return 2 ;;
+    *) emit "  ${red}failed${off}     $name - HTTP $API_STATUS $(J .message)"; return 2 ;;
+  esac
+  while (( waited < FORK_TIMEOUT )); do
+    sleep 3; waited=$((waited + 3))
+    api_raw GET "/repos/$TARGET_ORG/$name"
+    [[ $API_STATUS == 200 ]] && { emit "  ${grn}created${off}    $name ${dim}${waited}s${off}"; return 0; }
+  done
+  warn "fork $name not visible after ${FORK_TIMEOUT}s"
+  note_deferred "$name"
+  return 3
+}
+
+# GitHub throttles fork creation (secondary rate limit), so creations are
+# serialised across the parallel workers and spaced out.
+fork_throttle() {
+  local now wait last
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$STATE_DIR/fork.lock"
+    flock 8 || return 0
+  fi
+  last=$(cat "$STATE_DIR/lastfork" 2>/dev/null || echo 0)
+  now=$(date +%s); wait=$(( last + FORK_SPACING - now ))
+  (( wait > 0 )) && sleep "$wait"
+  date +%s >"$STATE_DIR/lastfork"
+  return 0
+}
+
+note_deferred() { # remember repos that still need work, for the closing summary
+  local f=$STATE_DIR/deferred
+  [[ -f $f ]] && grep -qxF "$1" "$f" || echo "$1" >>"$f"
+}
+
+upstream_branches() { # NAME -> every branch name (paginated, >100 branches safe)
+  local name=$1 page=1 n
+  while :; do
+    api_raw GET "/repos/$SOURCE_ORG/$name/branches?per_page=100&page=$page" || return 1
+    [[ $API_STATUS == 200 ]] || return 1
+    n=$(jq 'length' "$RESP")
+    [[ ${n:-0} == 0 ]] && break
+    J '.[].name'
+    [[ $n -lt 100 ]] && break
+    page=$((page + 1))
+  done
+  return 0
+}
+# NOTE: /git/refs/* ignores ?page= (it keeps returning the first page), so the
+# paginated /branches and /tags listings are used for all bulk ref comparisons.
+ref_map() { # ref_map ORG NAME -> "refs/heads/<name><TAB>sha" for every branch
+  local org=$1 name=$2 page=1 n
+  while :; do
+    api_raw GET "/repos/$org/$name/branches?per_page=100&page=$page"
+    [[ $API_STATUS == 200 ]] || break
+    n=$(jq 'length' "$RESP")
+    [[ ${n:-0} == 0 ]] && break
+    jq -r --arg p "refs/heads/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
+    [[ $n -lt 100 ]] && break
+    page=$((page + 1))
+  done
+  return 0
+}
+
+tag_map() { # tag_map ORG NAME -> "refs/tags/<name><TAB>commit sha"
+  local org=$1 name=$2 page=1 n
+  while :; do
+    api_raw GET "/repos/$org/$name/tags?per_page=100&page=$page"
+    [[ $API_STATUS == 200 ]] || break
+    n=$(jq 'length' "$RESP")
+    [[ ${n:-0} == 0 ]] && break
+    jq -r --arg p "refs/tags/" '.[] | [$p + .name, .commit.sha] | @tsv' "$RESP"
+    [[ $n -lt 100 ]] && break
+    page=$((page + 1))
+  done
+  return 0
+}
+
+sha_of() { # sha_of MAPFILE REFNAME -> sha
+  awk -F'\t' -v r="$2" '$1 == r { print $2; exit }' "$1"
+}
+
+target_sha() { api_raw GET "/repos/$TARGET_ORG/$1/git/ref/heads/$(enc "$2")"; [[ $API_STATUS == 200 ]] && J '.object.sha'; }
+upstream_sha() { api_raw GET "/repos/$SOURCE_ORG/$1/git/ref/heads/$(enc "$2")"; [[ $API_STATUS == 200 ]] && J '.object.sha'; }
+enc() { jq -rn --arg s "$1" '$s|@uri'; }
+
+create_ref() { # NAME REF SHA -> branch exists upstream but not in the mirror yet
+  local name=$1 ref=$2 sha=$3
+  [[ $DRY == 1 ]] && { echo "would-create-ref"; return; }
+  api_raw POST "/repos/$TARGET_ORG/$name/git/refs" "$(jq -nc --arg r "$ref" --arg s "$sha" '{ref:$r,sha:$s}')"
+  if [[ $API_STATUS == 201 ]]; then echo "created-ref:${sha:0:7}"
+  else echo "needs-mirror:new branch $ref is not reachable in the fork -> ./craftgang.sh mirror -r $name"; fi
+}
+
+merge_upstream() { # NAME BRANCH -> "synced|upto-date|conflict:<msg>"
+  local name=$1 branch=$2 msg
+  [[ $DRY == 1 ]] && { echo "would-sync"; return; }
+  api_raw POST "/repos/$TARGET_ORG/$name/merge-upstream" "$(jq -nc --arg b "$branch" '{branch:$b}')"
+  case $API_STATUS in
+    200) msg=$(J .message)
+         [[ $msg == *"not behind"* ]] && echo not-behind || echo synced ;;
+    204) echo upto-date ;;
+    404) echo gone ;;
+    *)   echo "conflict:$(J .message)" ;;
+  esac
+}
+
+sync_branches() { # NAME -> branch<TAB>action<TAB>note   (2 bulk calls when nothing changed)
+  local name=$1 ref sha tsha act branch
+  local up=$STATE_DIR/up.$name.tmp tp=$STATE_DIR/dst.$name.tmp
+  ref_map "$SOURCE_ORG" "$name" >"$up"
+  ref_map "$TARGET_ORG" "$name" >"$tp"
+  while IFS=$'\t' read -r ref sha; do
+    [[ -z ${ref:-} ]] && continue
+    branch=${ref#refs/heads/}
+    tsha=$(sha_of "$tp" "$ref")
+    if [[ -z ${sha:-} ]]; then
+      continue
+    elif [[ -z $tsha ]]; then
+      act=$(create_ref "$name" "$ref" "$sha")
+    elif [[ $tsha == "$sha" ]]; then
+      act=upto-date
+    elif [[ $FORCE == 1 ]]; then
+      act=$(force_sha "$name" "$ref" "$sha" "$tsha")
+    else
+      act=$(merge_upstream "$name" "$branch")
+      # a mirror must match exactly: fast-forward if possible, hard reset otherwise
+      tsha=$(target_sha "$name" "$branch")
+      if [[ $tsha != "$sha" ]]; then
+        act="$(force_sha "$name" "$ref" "$sha" "$tsha") ${dim}(after ${act%%:*})${off}"
+      fi
+    fi
+    printf '%s\t%s\t%s\n' "$branch" "${act%%:*}" "${act#*:}"
+  done <"$up"
+  rm -f "$up" "$tp"
+  return 0
+}
+
+force_sha() { # NAME REF UP_SHA CUR_SHA -> hard reset (or create) the mirror ref
+  local name=$1 ref=$2 sha=$3 cur=$4
+  [[ $DRY == 1 ]] && { echo "would-force"; return; }
+  if [[ -z $cur ]]; then echo "$(create_ref "$name" "$ref" "$sha")"; return; fi
+  api_raw PATCH "/repos/$TARGET_ORG/$name/git/refs/${ref#refs/}" "$(jq -nc --arg s "$sha" '{sha:$s,force:true}')"
+  [[ $API_STATUS == 200 ]] && echo "forced:${cur:0:7}->${sha:0:7}" || echo "force-failed:$(J .message)"
+}
+
+
+sync_tags() { # NAME -> tag<TAB>action<TAB>sha  (bulk compare, then add/update what differs)
+  local name=$1 ref sha tsha page=1
+  local up=$STATE_DIR/tup.$name.tmp tp=$STATE_DIR/tdst.$name.tmp
+  tag_map "$TARGET_ORG" "$name" >"$tp"
+  tag_map "$SOURCE_ORG" "$name" >"$up"
+  while IFS=$'\t' read -r ref sha; do
+    [[ -z ${ref:-} ]] && continue
+    tsha=$(sha_of "$tp" "$ref")
+    [[ -n $tsha && $tsha == "$sha" ]] && continue
+    # prefer the annotated tag object so annotations survive the copy
+    local obj=$sha
+    api_raw GET "/repos/$SOURCE_ORG/$name/git/ref/${ref#refs/}"
+    [[ $API_STATUS == 200 && $(J .object.type) == tag ]] && obj=$(J .object.sha)
+    if [[ $DRY == 1 ]]; then printf '%s\twould-tag\t%s\n' "${ref#refs/tags/}" "${obj:0:7}"; continue; fi
+    if [[ -z $tsha ]]; then
+      api_raw POST "/repos/$TARGET_ORG/$name/git/refs" "$(jq -nc --arg r "$ref" --arg s "$obj" '{ref:$r,sha:$s}')"
+    else
+      api_raw PATCH "/repos/$TARGET_ORG/$name/git/refs/${ref#refs/}" "$(jq -nc --arg s "$obj" '{sha:$s,force:true}')"
+    fi
+    case $API_STATUS in
+      200|201) printf '%s\t%s\t%s\n' "${ref#refs/tags/}" "$( [[ $API_STATUS == 201 ]] && echo tagged || echo retagged )" "${obj:0:7}" ;;
+      *)       printf '%s\ttag-failed\t%s\n' "${ref#refs/tags/}" "$(J .message)" ;;
+    esac
+  done <"$up"
+  rm -f "$up" "$tp"
+  return 0
+}
+
+prune_refs() { # NAME heads|tags -> delete mirror refs upstream no longer has
+  local name=$1 kind=$2 ref up=$STATE_DIR/pup.$name.tmp tp=$STATE_DIR/pdst.$name.tmp
+  if [[ $kind == heads ]]; then
+    ref_map "$SOURCE_ORG" "$name"    >"$up"
+    ref_map "$TARGET_ORG" "$name"   >"$tp"
+  else
+    tag_map "$SOURCE_ORG" "$name"    >"$up"
+    tag_map "$TARGET_ORG" "$name"   >"$tp"
+  fi
+  local refs
+  refs=$(cut -f1 "$tp")
+  while read -r ref; do
+    [[ -z $ref ]] && continue
+    grep -qxF "$ref" "$up" && continue
+    if [[ $DRY == 1 ]]; then emit "  ${ylw}prune${off}      $name:${ref#refs/} ${dim}(would delete)${off}"; continue; fi
+    api_raw DELETE "/repos/$TARGET_ORG/$name/git/refs/${ref#refs/}"
+    [[ $API_STATUS == 204 ]] && emit "  ${ylw}pruned${off}     $name:${ref#refs/}"
+  done <<<"$refs"
+  rm -f "$up" "$tp"
+  return 0
+}
+
+# ------------------------------ one repository ----------------------------
+BUF=""                                   # per-repo output buffer, flushed atomically
+emit() { BUF+="$(printf '%b\n' "$*")"$'\n'; }
+flush() { [[ -n $BUF ]] && printf '%s' "$BUF"; BUF=""; }
+
+sync_one() { # one row from source_repos
+  local name archived isfork parent def priv size st rc
+  IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
+  st=$(target_state "$name")
+  case $st in
+    none)
+      if [[ $archived == true && $SKIP_ARCH == 1 ]]; then
+        emit "  ${ylw}skip${off}       $name ${dim}(archived upstream)${off}"; flush; return 0
+      fi
+      create_fork "$name"; rc=$?
+      if (( rc == 0 )); then
+        st=fork:"$SOURCE_ORG/$name"
+      else
+        case $rc in
+          3) emit "  ${ylw}deferred${off}   $name ${dim}picked up by the next run${off}"; flush; return 3 ;;
+          4) flush; return 0 ;;
+          *) emit "  ${ylw}mirror${off}      $name ${dim}fork refused -> ./craftgang.sh mirror -r $name${off}"; flush; return 2 ;;
+        esac
+      fi ;;
+    http*) emit "  ${red}error${off}      $name - $st"; flush; return 1 ;;
+    plain) emit "  ${dim}plain repo${off}   $name - refs pushed server side" ;;
+  esac
+  local b act note n=0 up=0 cur=0 bad=0
+  while IFS=$'\t' read -r b act note; do
+    [[ -z ${b:-} ]] && continue
+    n=$((n + 1))
+    case $act in
+      synced|forced|would-sync|would-force) up=$((up + 1)); emit "    ${grn}$act${off} ${b} ${dim}${note}${off}" ;;
+      upto-date) cur=$((cur + 1)) ;;
+      *) bad=$((bad + 1)); emit "    ${red}$act${off} ${b} ${dim}${note}${off}" ;;
+    esac
+  done <<<"$(sync_branches "$name")"
+  emit "  ${grn}ok${off}         $name ${dim}${n} branches | ${up} updated | ${cur} current${off}"
+  (( bad )) && emit "  ${red}stale${off}      $name ${bad} branch(es) need --force or manual review"
+
+  if [[ $TAGS == 1 ]]; then
+    local t a s
+    while IFS=$'\t' read -r t a s; do [[ -n ${t:-} ]] && emit "    ${grn}$a${off} $t ${dim}${s}${off}"; done <<<"$(sync_tags "$name")"
+  fi
+  if [[ $PRUNE == 1 ]]; then prune_refs "$name" heads; prune_refs "$name" tags; fi
+  flush
+  return 0
+}
+
+run_pool() { # run_pool FUNC  <one TSV row per line on stdin  (rolling window)
+  local fn=$1 line
+  while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    while (( $(jobs -rp | wc -l) >= PARALLEL )); do wait -n || true; done
+    "$fn" "$line" &
+  done
+  wait
+  return 0
+}
+
+single_run_guard() { # refuse two concurrent runs (they would fight over refs)
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$STATE_DIR/lock" || return 0
+  flock -n 9 || die "another craftgang.sh run is still going ($STATE_DIR/lock)"
+}
+
+# --------------------------------- commands -------------------------------
+cmd_sync() {
+  load_token
+  single_run_guard
+  local rows total
+  rows=$(target_rows) || die "cannot list $SOURCE_ORG"
+  total=$(grep -c . <<<"$rows")
+  say "${bold}$SOURCE_ORG${off}  ->  ${bold}$TARGET_ORG${off}   $total repositories   ${dim}server side, nothing on disk${off}"
+  [[ $DRY == 1 ]] && say "${ylw}dry run - no changes${off}"
+  : >"$STATE_DIR/deferred"
+  printf '%s\n' "$rows" | run_pool sync_one
+  say ""
+  if [[ -s $STATE_DIR/deferred ]]; then
+    say "${ylw}deferred (fork rate limit), run again to finish:${off} $(tr '\n' ' ' <"$STATE_DIR/deferred")"
+    [[ $DRY == 1 ]] || rm -f "$STATE_DIR/deferred"
+  fi
+  say "finished ${dim}$(date -u '+%F %T UTC') - log: $LOG_FILE${off}"
+}
+
+cmd_status() {
+  load_token
+  local name rest archived isfork parent def priv size st na nb state note first=1
+  if [[ $JSON_OUT == 1 ]]; then printf '['; fi
+  [[ $JSON_OUT == 1 ]] || printf '%-44s %-8s %-9s %s\n' "${bold}REPO${off}" "${bold}STATE${off}" "${bold}BRANCHES${off}" "${bold}NOTE${off}"
+  while IFS=$SEP read -r name archived isfork parent def priv size; do
+    [[ -z ${name:-} ]] && continue
+    st=$(target_state "$name")
+    nb=$(upstream_branches "$name" | grep -c .)
+    na=$(target_branch_count "$name")
+    state=${st%%:*}
+    if [[ $state == fork ]]; then
+      [[ $st == fork:"$SOURCE_ORG/$name" ]] && note=upstream\=$SOURCE_ORG || note="${red}wrong parent${off}"
+    else
+      note=${st#fork:}
+    fi
+    if [[ $JSON_OUT == 1 ]]; then
+      [[ $first == 1 ]] && first=0 || printf ','
+      jq -nc --arg n "$name" --arg s "$state" --arg p "$parent" --arg a "$archived" --argjson nb "${nb:-0}" --argjson na "$na" \
+        '{repo:$n,state:$s,upstream:$p,archived:($a=="true"),up_branches:$nb,mirrored_branches:$na}'
+    else
+      printf '%-44s %-8s %-9s %s\n' "$name" "$state" "$na/$nb" "$note"
+    fi
+  done < <(target_rows)
+  [[ $JSON_OUT == 1 ]] && printf ']'
+  return 0
+}
+
+target_branch_count() { # NAME -> number of branches in the mirror (paginated)
+  local name=$1 page=1 n total=0
+  while :; do
+    api_raw GET "/repos/$TARGET_ORG/$name/branches?per_page=100&page=$page"
+    [[ $API_STATUS == 200 ]] || break
+    n=$(jq 'length' "$RESP")
+    [[ ${n:-0} == 0 ]] && break
+    total=$((total + n))
+    [[ $n -lt 100 ]] && break
+    page=$((page + 1))
+  done
+  echo "$total"
+}
+
+cmd_verify() {
+  load_token
+  single_run_guard
+  local rows; rows=$(target_rows)
+  : >"$STATE_DIR/drift.tsv"
+  say "${bold}$SOURCE_ORG${off} vs ${bold}$TARGET_ORG${off} - comparing ${ALL:-default branches}${ALL:+ of every branch}   ${dim}drift list: $STATE_DIR/drift.tsv${off}"
+  printf '%s\n' "$rows" | run_pool verify_one
+  local drift; drift=$(wc -l <"$STATE_DIR/drift.tsv")
+  if (( drift )); then warn "$drift branch(es) differ from $SOURCE_ORG"; exit 1; fi
+  say "${grn}in sync${off} - every compared branch is byte-identical by commit SHA"
+}
+
+verify_one() { # one row -> compares branch head SHAs, 2 bulk API calls per repo
+  local name archived isfork parent def priv size st n=0 bad=0 ref sha tsha up tp
+  IFS=$SEP read -r name archived isfork parent def priv size <<<"$1"
+  up=$STATE_DIR/vup.$name.tmp; tp=$STATE_DIR/vdst.$name.tmp
+  st=$(target_state "$name")
+  if [[ $st == none ]]; then
+    if [[ $archived == true || ${size:-0} == 0 ]]; then
+      emit "  ${dim}empty${off}      $name ${dim}(upstream has no content)${off}"; flush; return 0
+    fi
+    printf '%s\t%s\t%s\n' "$name" "-" "missing" >>"$STATE_DIR/drift.tsv"
+    emit "  ${red}missing${off}    $name"; flush; return 1
+  fi
+  ref_map "$SOURCE_ORG" "$name" >"$up"
+  ref_map "$TARGET_ORG" "$name" >"$tp"
+  if [[ -z ${ALL:-} && -n $def ]]; then          # only the default branch unless -a
+    grep -F "refs/heads/$def	" "$up" >"$up.2" || : >"$up.2"
+    mv "$up.2" "$up"
+  fi
+  while IFS=$'\t' read -r ref sha; do
+    [[ -z ${ref:-} ]] && continue
+    n=$((n + 1))
+    tsha=$(sha_of "$tp" "$ref")
+    [[ -n $tsha && $tsha == "$sha" ]] && continue
+    bad=$((bad + 1))
+    printf '%s\t%s\t%s\n' "$name" "${ref#refs/heads/}" "${tsha:-missing}" >>"$STATE_DIR/drift.tsv"
+    emit "  ${red}drift${off}      $name ${ref#refs/heads/} ${dim}${tsha:-missing} != ${sha:0:7}${off}"
+  done <"$up"
+  if (( bad )); then emit "  ${red}stale${off}      $name ${bad}/${n} branch(es) differ - run: sync -r $name"
+  else emit "  ${grn}ok${off}         $name ${dim}${n} branch(es) identical${off}"; fi
+  rm -f "$up" "$tp"
+  flush
+  return 0
+}
+
+mirror_repo() { # disk fallback for what the API cannot do (new objects, >fork limits)
+  local name=$1 dir=$STATE_DIR/mirrors/$name.git url=git@$GIT_HOST:$TARGET_ORG/$name.git
+  export GIT_SSH_COMMAND="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o BatchMode=yes"
+  if [[ -d $dir ]]; then
+    say "  ${blu}update${off} $name ${dim}(incremental fetch)${off}"
+    git -C "$dir" remote update --prune >/dev/null || { warn "fetch $name failed"; return 1; }
+  else
+    say "  ${blu}clone${off}  $name ${dim}(bare mirror cached in $STATE_DIR/mirrors)${off}"
+    git clone --quiet --mirror "git@$GIT_HOST:$SOURCE_ORG/$name.git" "$dir" || { warn "clone $name failed"; return 1; }
+  fi
+  [[ $DRY == 1 ]] && { say "  ${blu}push${off}     $name ${dim}(dry)${off}"; return 0; }
+  say "  ${blu}push${off}   $name"
+  # explicit refspecs: --mirror would also try to push refs/pull/*, which GitHub rejects
+  git -C "$dir" push --quiet --force --prune "$url" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*' \
+    || { warn "push $name failed"; return 1; }
+  say "  ${grn}pushed${off} $name"
+  [[ $KEEP_MIRRORS == 0 ]] && { rm -rf "$dir"; say "  ${dim}dropped cached mirror${off}"; }
+  return 0
+}
+
+cmd_mirror() {
+  load_token
+  local rows name rest
+  rows=$(target_rows)
+  if [[ ${#ONLY[@]} == 0 && $ALLOW_DISK == 0 ]]; then
+    say "mirror copies objects through git, so it needs scratch disk."
+    say "restrict it with -r NAME, or pass --keep-disk to mirror everything."
+    exit 2
+  fi
+  while IFS=$SEP read -r name rest; do [[ -n ${name:-} ]] && mirror_repo "$name"; done <<<"$rows"
+}
+
+cmd_token() {
+  local src=${CMD_ARG:-} tok
+  if [[ -z $src || $src == show ]]; then
+    if [[ -s $STATE_DIR/token ]]; then echo "stored: $STATE_DIR/token"
+    else echo "no stored token - falling back to GH_TOKEN / gh CLI"; fi
+    return 0
+  fi
+  if [[ $src == - ]]; then tok=$(tr -d ' \t\r\n'); else tok=$(tr -d ' \t\r\n' <"$src"); fi
+  [[ -n $tok ]] || die "empty token"
+  printf '%s' "$tok" >"$STATE_DIR/token"
+  chmod 600 "$STATE_DIR/token"
+  say "saved token -> $STATE_DIR/token"
+  unset TOKEN; cmd_auth
+}
+
+cmd_schedule() {
+  local every=${CMD_ARG:-6h} expr
+  if [[ $every == clear ]]; then
+    (crontab -l 2>/dev/null | grep -v 'craftgang-sync') | crontab -
+    say "cron entry removed"; return 0
+  fi
+  case $every in
+    daily) expr="0 7 * * *" ;;
+    *h)    expr="0 */${every%h} * * *" ;;
+    *)     die "interval must look like 6h or daily" ;;
+  esac
+  local line="$expr cd $SCRIPT_DIR && ./craftgang.sh sync -q >>$STATE_DIR/cron.log 2>&1  # craftgang-sync"
+  { crontab -l 2>/dev/null | grep -v 'craftgang-sync'; echo "$line"; } | crontab -
+  say "installed cron ${bold}$expr${off} -> $SCRIPT_DIR/craftgang.sh sync"
+}
+
+# ----------------------------------- main ---------------------------------
+case $CMD in
+  help)     usage ;;
+  sync)     cmd_sync ;;
+  plan)     DRY=1; cmd_sync ;;
+  status)   cmd_status ;;
+  verify)   cmd_verify ;;
+  mirror)   cmd_mirror ;;
+  auth)     cmd_auth ;;
+  token)    cmd_token ;;
+  schedule) cmd_schedule ;;
+  clean)    rm -rf "$STATE_DIR/mirrors"; mkdir -p "$STATE_DIR/mirrors"; say "removed on-disk mirrors" ;;
+esac
